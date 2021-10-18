@@ -690,6 +690,7 @@ func schedinit() {
 	fastrandinit() // must run before mcommoninit
 	mcommoninit(_g_.m, -1)
 	cpuinit()       // must run before alginit
+	// 这里调用alginit()
 	alginit()       // maps must not be used before this call
 	modulesinit()   // provides activeModules
 	typelinksinit() // uses maps, activeModules

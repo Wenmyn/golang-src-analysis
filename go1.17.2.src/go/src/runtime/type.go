@@ -374,7 +374,8 @@ type maptype struct {
 	key    *_type
 	elem   *_type
 	bucket *_type // internal type representing a hash bucket
-	// function for hashing keys (ptr to key, seed) -> hash
+	// hasher的第一个参数就是指向key的指针，h.hash0 = fastrand()得到的hash0，就是hasher方法的第二个参数。
+	// hasher方法返回的就是hash值。
 	hasher     func(unsafe.Pointer, uintptr) uintptr
 	keysize    uint8  // size of key slot
 	elemsize   uint8  // size of elem slot

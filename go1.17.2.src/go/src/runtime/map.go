@@ -61,48 +61,42 @@ import (
 )
 
 const (
-	// Maximum number of key/elem pairs a bucket can hold.
+	// 一个桶中最多能装载的键值对（key-value）的个数为8
 	bucketCntBits = 3
 	bucketCnt     = 1 << bucketCntBits
 
-	// Maximum average load of a bucket that triggers growth is 6.5.
-	// Represent as loadFactorNum/loadFactorDen, to allow integer math.
+	// 触发扩容的装载因子为13/2=6.5
 	loadFactorNum = 13
 	loadFactorDen = 2
 
-	// Maximum key or elem size to keep inline (instead of mallocing per element).
-	// Must fit in a uint8.
-	// Fast versions cannot handle big elems - the cutoff size for
-	// fast versions in cmd/compile/internal/gc/walk.go must be at most this elem.
+	// 键和值超过128个字节，就会被转换为指针
 	maxKeySize  = 128
 	maxElemSize = 128
 
-	// data offset should be the size of the bmap struct, but needs to be
-	// aligned correctly. For amd64p32 this means 64-bit alignment
-	// even though pointers are 32 bit.
+	// 数据偏移量应该是bmap结构体的大小，它需要正确地对齐。
+	// 对于amd64p32而言，这意味着：即使指针是32位的，也是64位对齐。
 	dataOffset = unsafe.Offsetof(struct {
 		b bmap
 		v int64
 	}{}.v)
 
-	// Possible tophash values. We reserve a few possibilities for special marks.
-	// Each bucket (including its overflow buckets, if any) will have either all or none of its
-	// entries in the evacuated* states (except during the evacuate() method, which only happens
-	// during map writes and thus no one else can observe the map during that time).
-	emptyRest      = 0 // this cell is empty, and there are no more non-empty cells at higher indexes or overflows.
-	emptyOne       = 1 // this cell is empty
-	evacuatedX     = 2 // key/elem is valid.  Entry has been evacuated to first half of larger table.
-	evacuatedY     = 3 // same as above, but evacuated to second half of larger table.
-	evacuatedEmpty = 4 // cell is empty, bucket is evacuated.
-	minTopHash     = 5 // minimum tophash for a normal filled cell.
+	// 每个桶（如果有溢出，则包含它的overflow的链接桶）在搬迁完成状态（evacuated* states）下，
+	// 要么会包含它所有的键值对，要么一个都不包含（但不包括调用evacuate()方法阶段，
+	// 该方法调用只会在对map发起write时发生，在该阶段其他goroutine是无法查看该map的）。简单的说，桶里的数据要么一起搬走，要么一个都还未搬。
+	emptyRest      = 0 // 表示cell为空，并且比它高索引位的cell或者overflows中的cell都是空的。（初始化bucket时，就是该状态）
+	emptyOne       = 1 // 空的cell，cell已经被搬迁到新的bucket
+	evacuatedX     = 2 // 键值对已经搬迁完毕，key在新buckets数组的前半部分
+	evacuatedY     = 3 // 键值对已经搬迁完毕，key在新buckets数组的后半部分
+	evacuatedEmpty = 4 // cell为空，整个bucket已经搬迁完毕
+	minTopHash     = 5 // tophash的最小正常值
 
 	// flags
-	iterator     = 1 // there may be an iterator using buckets
-	oldIterator  = 2 // there may be an iterator using oldbuckets
-	hashWriting  = 4 // a goroutine is writing to the map
-	sameSizeGrow = 8 // the current map growth is to a new map of the same size
+	iterator     = 1 // 可能有迭代器在使用buckets
+	oldIterator  = 2 // 可能有迭代器在使用oldbuckets
+	hashWriting  = 4 // 有协程正在向map写人key
+	sameSizeGrow = 8 // 等量扩容
 
-	// sentinel bucket ID for iterator checks
+	// 用于迭代器检查的bucket ID
 	noCheck = 1<<(8*sys.PtrSize) - 1
 )
 
@@ -113,49 +107,37 @@ func isEmpty(x uint8) bool {
 
 // A header for a Go map.
 type hmap struct {
-	// Note: the format of the hmap is also encoded in cmd/compile/internal/reflectdata/reflect.go.
-	// Make sure this stays in sync with the compiler's definition.
-	count     int // # live cells == size of map.  Must be first (used by len() builtin)
-	flags     uint8
-	B         uint8  // log_2 of # of buckets (can hold up to loadFactor * 2^B items)
-	noverflow uint16 // approximate number of overflow buckets; see incrnoverflow for details
-	hash0     uint32 // hash seed
+	count     int 		// 代表哈希表中的元素个数，调用len(map)时，返回的就是该字段值。
+	flags     uint8 	// 状态标志，下文常量中会解释四种状态位含义。
+	B         uint8 	// buckets（桶）的对数log_2（哈希表元素数量最大可达到装载因子*2^B）
+	noverflow uint16 	// 溢出桶的大概数量。
+	hash0     uint32	// 哈希种子。
 
-	buckets    unsafe.Pointer // array of 2^B Buckets. may be nil if count==0.
-	oldbuckets unsafe.Pointer // previous bucket array of half the size, non-nil only when growing
-	nevacuate  uintptr        // progress counter for evacuation (buckets less than this have been evacuated)
+	buckets    unsafe.Pointer // 指向buckets数组的指针，数组大小为2^B，如果元素个数为0，它为nil。
+	oldbuckets unsafe.Pointer // 如果发生扩容，oldbuckets是指向老的buckets数组的指针，老的buckets数组大小是新的buckets的1/2。非扩容状态下，它为nil。
+	nevacuate  uintptr        // 表示扩容进度，小于此地址的buckets代表已搬迁完成。
 
-	extra *mapextra // optional fields
+	extra *mapextra // 这个字段是为了优化GC扫描而设计的。当key和value均不包含指针，并且都可以inline时使用。extra是指向mapextra类型的指针。
 }
 
 // mapextra holds fields that are not present on all maps.
 type mapextra struct {
-	// If both key and elem do not contain pointers and are inline, then we mark bucket
-	// type as containing no pointers. This avoids scanning such maps.
-	// However, bmap.overflow is a pointer. In order to keep overflow buckets
-	// alive, we store pointers to all overflow buckets in hmap.extra.overflow and hmap.extra.oldoverflow.
-	// overflow and oldoverflow are only used if key and elem do not contain pointers.
-	// overflow contains overflow buckets for hmap.buckets.
-	// oldoverflow contains overflow buckets for hmap.oldbuckets.
-	// The indirection allows to store a pointer to the slice in hiter.
+	// 如果 key 和 value 都不包含指针，并且可以被 inline(<=128 字节)
+	// 就使用 hmap的extra字段 来存储 overflow buckets，这样可以避免 GC 扫描整个 map
+	// 然而 bmap.overflow 也是个指针。这时候我们只能把这些 overflow 的指针
+	// 都放在 hmap.extra.overflow 和 hmap.extra.oldoverflow 中了
 	overflow    *[]*bmap
 	oldoverflow *[]*bmap
 
-	// nextOverflow holds a pointer to a free overflow bucket.
+	// 指向空闲的 overflow bucket 的指针
 	nextOverflow *bmap
 }
 
 // A bucket for a Go map.
 type bmap struct {
-	// tophash generally contains the top byte of the hash value
-	// for each key in this bucket. If tophash[0] < minTopHash,
-	// tophash[0] is a bucket evacuation state instead.
+	// tophash包含此桶中每个键的哈希值最高字节（高8位）信息（也就是前面所述的high-order bits）。
+	// 如果tophash[0] < minTopHash，tophash[0]则代表桶的搬迁（evacuation）状态。
 	tophash [bucketCnt]uint8
-	// Followed by bucketCnt keys and then bucketCnt elems.
-	// NOTE: packing all the keys together and then all the elems together makes the
-	// code a bit more complicated than alternating key/elem/key/elem/... but it allows
-	// us to eliminate padding which would be needed for, e.g., map[int64]int8.
-	// Followed by an overflow pointer.
 }
 
 // A hash iteration structure.
@@ -190,7 +172,7 @@ func bucketMask(b uint8) uintptr {
 	return bucketShift(b) - 1
 }
 
-// tophash calculates the tophash value for hash.
+// 再用哈希值的高8位，找到此key在桶中的位置。
 func tophash(hash uintptr) uint8 {
 	top := uint8(hash >> (sys.PtrSize*8 - 8))
 	if top < minTopHash {
@@ -286,21 +268,19 @@ func makemap64(t *maptype, hint int64, h *hmap) *hmap {
 	return makemap(t, int(hint), h)
 }
 
-// makemap_small implements Go map creation for make(map[k]v) and
-// make(map[k]v, hint) when hint is known to be at most bucketCnt
-// at compile time and the map needs to be allocated on the heap.
+//对于不指定初始化大小，和初始化值hint<=8（bucketCnt）时，
+//go会调用makemap_small函数（源码位置src/runtime/map.go），并直接从堆上进行分配。
 func makemap_small() *hmap {
 	h := new(hmap)
 	h.hash0 = fastrand()
 	return h
 }
 
-// makemap implements Go map creation for make(map[k]v, hint).
-// If the compiler has determined that the map or the first bucket
-// can be created on the stack, h and/or bucket may be non-nil.
-// If h != nil, the map can be created directly in h.
-// If h.buckets != nil, bucket pointed to can be used as the first bucket.
+// 如果编译器认为map和第一个bucket可以直接创建在栈上，h和bucket可能都是非空
+// 如果h != nil，那么map可以直接在h中创建
+// 如果h.buckets != nil，那么h指向的bucket可以作为map的第一个bucket使用
 func makemap(t *maptype, hint int, h *hmap) *hmap {
+	// math.MulUintptr返回hint与t.bucket.size的乘积，并判断该乘积是否溢出。
 	mem, overflow := math.MulUintptr(uintptr(hint), t.bucket.size)
 	if overflow || mem > maxAlloc {
 		hint = 0
@@ -310,21 +290,21 @@ func makemap(t *maptype, hint int, h *hmap) *hmap {
 	if h == nil {
 		h = new(hmap)
 	}
+	// 通过fastrand得到哈希种子
 	h.hash0 = fastrand()
 
-	// Find the size parameter B which will hold the requested # of elements.
-	// For hint < 0 overLoadFactor returns false since hint < bucketCnt.
+	// 根据输入的元素个数hint，找到能装下这些元素的B值
 	B := uint8(0)
 	for overLoadFactor(hint, B) {
 		B++
 	}
 	h.B = B
 
-	// allocate initial hash table
-	// if B == 0, the buckets field is allocated lazily later (in mapassign)
-	// If hint is large zeroing this memory could take a while.
+	// 分配初始哈希表
+	// 如果B为0，那么buckets字段后续会在mapassign方法中lazily分配
 	if h.B != 0 {
 		var nextOverflow *bmap
+		// makeBucketArray创建一个map的底层保存buckets的数组，它最少会分配h.B^2的大小。
 		h.buckets, nextOverflow = makeBucketArray(t, h.B, nil)
 		if nextOverflow != nil {
 			h.extra = new(mapextra)
@@ -335,21 +315,13 @@ func makemap(t *maptype, hint int, h *hmap) *hmap {
 	return h
 }
 
-// makeBucketArray initializes a backing array for map buckets.
-// 1<<b is the minimum number of buckets to allocate.
-// dirtyalloc should either be nil or a bucket array previously
-// allocated by makeBucketArray with the same t and b parameters.
-// If dirtyalloc is nil a new backing array will be alloced and
-// otherwise dirtyalloc will be cleared and reused as backing array.
+// makeBucket为map创建用于保存buckets的数组。
 func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets unsafe.Pointer, nextOverflow *bmap) {
 	base := bucketShift(b)
 	nbuckets := base
-	// For small b, overflow buckets are unlikely.
-	// Avoid the overhead of the calculation.
+	// 对于小的b值（小于4），即桶的数量小于16时，使用溢出桶的可能性很小。对于此情况，就避免计算开销。
 	if b >= 4 {
-		// Add on the estimated number of overflow buckets
-		// required to insert the median number of elements
-		// used with this value of b.
+		// 当桶的数量大于等于16个时，正常情况下就会额外创建2^(b-4)个溢出桶
 		nbuckets += bucketShift(b - 4)
 		sz := t.bucket.size * nbuckets
 		up := roundupsize(sz)
@@ -357,13 +329,12 @@ func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets un
 			nbuckets = up / t.bucket.size
 		}
 	}
-
+	// 这里，dirtyalloc分两种情况。
+	// 1.如果它为nil，则会分配一个新的底层数组。如果它不为nil，则它指向的是曾经分配过的底层数组，该底层数组是由之前同样的t和b参数通过makeBucketArray分配的，
+	// 2.如果数组不为空，需要把该数组之前的数据清空并复用。
 	if dirtyalloc == nil {
 		buckets = newarray(t.bucket, int(nbuckets))
 	} else {
-		// dirtyalloc was previously generated by
-		// the above newarray(t.bucket, int(nbuckets))
-		// but may not be empty.
 		buckets = dirtyalloc
 		size := t.bucket.size * nbuckets
 		if t.bucket.ptrdata != 0 {
@@ -373,57 +344,84 @@ func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets un
 		}
 	}
 
+	// 即b大于等于4的情况下，会预分配一些溢出桶。
+	// 为了把跟踪这些溢出桶的开销降至最低，使用了以下约定：
+
+	// 如果预分配的溢出桶的overflow指针为nil，那么可以通过指针碰撞（bumping the pointer）获得更多可用桶。
+	// （关于指针碰撞：
+	// 假设内存是绝对规整的，所有用过的内存都放在一边，空闲的内存放在另一边，中间放着一个指针作为分界点的指示器，
+	// 那所分配内存就仅仅是把那个指针向空闲空间那边挪动一段与对象大小相等的距离，
+	// 这种分配方式称为“指针碰撞”）
+
+	// 对于最后一个溢出桶，需要一个安全的非nil指针指向它。
 	if base != nbuckets {
-		// We preallocated some overflow buckets.
-		// To keep the overhead of tracking these overflow buckets to a minimum,
-		// we use the convention that if a preallocated overflow bucket's overflow
-		// pointer is nil, then there are more available by bumping the pointer.
-		// We need a safe non-nil pointer for the last overflow bucket; just use buckets.
 		nextOverflow = (*bmap)(add(buckets, base*uintptr(t.bucketsize)))
 		last := (*bmap)(add(buckets, (nbuckets-1)*uintptr(t.bucketsize)))
 		last.setoverflow(t, (*bmap)(buckets))
 	}
+
+	// 根据上述代码，我们能确定在正常情况下，
+	// 正常桶和溢出桶在内存中的存储空间是连续的，只是被 hmap 中的不同字段引用而已。
 	return buckets, nextOverflow
 }
 
-// mapaccess1 returns a pointer to h[key].  Never returns nil, instead
-// it will return a reference to the zero object for the elem type if
-// the key is not in the map.
-// NOTE: The returned pointer may keep the whole map live, so don't
-// hold onto it for very long.
+
 func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
+	// 如果开启了竞态检测 -race
 	if raceenabled && h != nil {
 		callerpc := getcallerpc()
 		pc := funcPC(mapaccess1)
 		racereadpc(unsafe.Pointer(h), callerpc, pc)
 		raceReadObjectPC(t.key, key, callerpc, pc)
 	}
+	// 如果开启了memory sanitizer -msan
 	if msanenabled && h != nil {
 		msanread(key, t.key.size)
 	}
+	// 如果map为空或者元素个数为0，返回零值
 	if h == nil || h.count == 0 {
 		if t.hashMightPanic() {
 			t.hasher(key, 0) // see issue 23734
 		}
 		return unsafe.Pointer(&zeroVal[0])
 	}
+	// 注意，这里是按位与操作
+	// 当h.flags对应的值为hashWriting（代表有其他goroutine正在往map中写key）时，那么位计算的结果不为0，因此抛出以下错误。
+	// 这也表明，go的map是非并发安全的
 	if h.flags&hashWriting != 0 {
 		throw("concurrent map read and map write")
 	}
+	// 不同类型的key，会使用不同的hash算法，可详见src/runtime/alg.go中typehash函数中的逻辑
 	hash := t.hasher(key, uintptr(h.hash0))
 	m := bucketMask(h.B)
+	// 按位与操作，找到对应的bucket(低位转换)
 	b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))
+	// 如果oldbuckets不为空，那么证明map发生了扩容
+	// 如果有扩容发生，老的buckets中的数据可能还未搬迁至新的buckets里
+	// 所以需要先在老的buckets中找
 	if c := h.oldbuckets; c != nil {
 		if !h.sameSizeGrow() {
 			// There used to be half as many buckets; mask down one more power of two.
 			m >>= 1
 		}
 		oldb := (*bmap)(add(c, (hash&m)*uintptr(t.bucketsize)))
+		// 如果在oldbuckets中tophash[0]的值，为evacuatedX、evacuatedY，evacuatedEmpty其中之一
+		// 则evacuated()返回为true，代表搬迁完成。
+		// 因此，只有当搬迁未完成时，才会从此oldbucket中遍历
 		if !evacuated(oldb) {
 			b = oldb
 		}
 	}
+	// 取出当前key值的tophash值
 	top := tophash(hash)
+	// 以下是查找的核心逻辑
+	// 双重循环遍历：外层循环是从桶到溢出桶遍历；内层是桶中的cell遍历
+
+	// 疑问：这个溢出桶是把整个map作为一块大的内存，并不是作为单个桶的溢出桶？ -作为单个桶bmap
+
+	// 跳出循环的条件有三种：第一种是已经找到key值；第二种是当前桶再无溢出桶；
+	// 第三种是当前桶中有cell位的tophash值是emptyRest，
+	// 这个值在前面解释过，它代表此时的桶后面的cell还未利用，所以无需再继续遍历。
 bucketloop:
 	for ; b != nil; b = b.overflow(t) {
 		for i := uintptr(0); i < bucketCnt; i++ {
@@ -433,10 +431,13 @@ bucketloop:
 				}
 				continue
 			}
+			// 因为在bucket中key是用连续的存储空间存储的，因此可以通过bucket地址+数据偏移量（bmap结构体的大小）+ keysize的大小，得到k的地址
+			// 同理，value的地址也是相似的计算方法，只是再要加上8个keysize的内存地址
 			k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))
 			if t.indirectkey() {
 				k = *((*unsafe.Pointer)(k))
 			}
+			// 判断key是否相等
 			if t.key.equal(key, k) {
 				e := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.elemsize))
 				if t.indirectelem() {
@@ -446,6 +447,7 @@ bucketloop:
 			}
 		}
 	}
+	// 所有的bucket都未找到，则返回零值
 	return unsafe.Pointer(&zeroVal[0])
 }
 

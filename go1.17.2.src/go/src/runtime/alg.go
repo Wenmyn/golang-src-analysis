@@ -309,7 +309,10 @@ var aeskeysched [hashRandomBytes]byte
 var hashkey [4]uintptr
 
 func alginit() {
-	// Install AES hash algorithms if the instructions needed are present.
+	// 对于哈希算法的选择，程序会根据当前架构判断是否支持AES
+	// 1.如果支持就使用AES hash，其实现代码位于src/runtime/asm_{386,amd64,arm64}.s中；
+	// 2.若不支持，其hash算法则根据xxhash算法（https://code.google.com/p/xxhash/）和cityhash算法（https://code.google.com/p/cityhash/）启发而来
+	// 代码分别对应于32位（src/runtime/hash32.go）和64位机器（src/runtime/hash32.go）中
 	if (GOARCH == "386" || GOARCH == "amd64") &&
 		cpu.X86.HasAES && // AESENC
 		cpu.X86.HasSSSE3 && // PSHUFB
