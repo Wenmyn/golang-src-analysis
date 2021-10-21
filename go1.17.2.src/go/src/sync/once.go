@@ -46,14 +46,11 @@ func (o *Once) Do(f func()) {
 	//		f()
 	//	}
 	//
-	// Do guarantees that when it returns, f has finished.
-	// This implementation would not implement that guarantee:
-	// given two simultaneous calls, the winner of the cas would
-	// call f, and the second would return immediately, without
-	// waiting for the first's call to f to complete.
-	// This is why the slow path falls back to a mutex, and why
-	// the atomic.StoreUint32 must be delayed until after f returns.
+	// 注：这种写法会因为有两个goroutinue同时调用Do函数时，
+	// 第二个Do就会立即返回了，有可能这是f()还没有初始化完成
 
+	// 1.使用mutex也是为了保证在f()期间，全程加锁
+	// 2.使用atomic.StoreUint32也必须延迟到f()返回之后
 	if atomic.LoadUint32(&o.done) == 0 {
 		// Outlined slow-path to allow inlining of the fast-path.
 		o.doSlow(f)
