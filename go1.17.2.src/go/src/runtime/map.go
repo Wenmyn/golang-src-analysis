@@ -166,10 +166,15 @@ type hiter struct {
 	startBucket uintptr        // bucket iteration started at
 	// 开始遍历bucket上的偏移量
 	offset      uint8          // intra-bucket offset to start from during iteration (should be big enough to hold bucketCnt-1)
+	// 是否从头遍历了
 	wrapped     bool           // already wrapped around from end of bucket array to beginning
+	// B 的大小
 	B           uint8
+	// 指示当前 cell 序号
 	i           uint8
+	// 指向当前的 bucket
 	bucket      uintptr
+	// 因为扩容，需要检查的 bucket
 	checkBucket uintptr
 }
 
@@ -257,6 +262,7 @@ func (h *hmap) newoverflow(t *maptype, b *bmap) *bmap {
 		ovf = (*bmap)(newobject(t.bucket))
 	}
 	h.incrnoverflow()
+	// 注：是否使用hmap.extra.overflow字段，取决于是否_maptype.bucket.ptrdata==0
 	if t.bucket.ptrdata == 0 {
 		h.createOverflow()
 		*h.extra.overflow = append(*h.extra.overflow, ovf)
@@ -537,6 +543,7 @@ func mapaccessK(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, unsafe
 			m >>= 1
 		}
 		oldb := (*bmap)(add(c, (hash&m)*uintptr(t.bucketsize)))
+		// 注：这里是由于迭代时候调用mapaccessK(),所以肯定是发生了扩容
 		if !evacuated(oldb) {
 			b = oldb
 		}
@@ -976,12 +983,11 @@ next:
 			k = *((*unsafe.Pointer)(k))
 		}
 		e := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+uintptr(offi)*uintptr(t.elemsize))
-		//如果 oldBucket 还存在，且非等容迁移
+		//如果 oldBucket 还存在，且非等量迁移
 		if checkBucket != noCheck && !h.sameSizeGrow() {
 			if t.reflexivekey() || t.key.equal(k, k) {
-				// If the item in the oldbucket is not destined for
-				// the current new bucket in the iteration, skip it.
 				hash := t.hasher(k, uintptr(h.hash0))
+				// 注：这里只有hash种子不一样才有可能！=
 				if hash&bucketMask(it.B) != checkBucket {	//如果不是相同的 key ，则跳过
 					continue
 				}
@@ -992,6 +998,12 @@ next:
 			}
 		}
 		// 这里表示没有进行迁移（不论是在 oldbuckets 还是 buckets）以及 NaN 的情况，都能遍历出来
+
+		// 注：这里b.tophash[offi] != evacuatedX如果按照正常扩容逻辑if !evacuated(b)是不会==的，
+		// 扩容是按照桶为基本单位的，
+		// 可能在遍历桶第一元素时，是没有发生扩容的，
+		// 但是在遍历桶第二个元素时，发生了扩容。
+		// 所以，要按照b.tophash[offi] != evacuatedX和b.tophash[offi] == evacuatedX情况分开讨论
 		if (b.tophash[offi] != evacuatedX && b.tophash[offi] != evacuatedY) ||
 			!(t.reflexivekey() || t.key.equal(k, k)) {
 			it.key = k
@@ -1007,6 +1019,7 @@ next:
 			it.key = rk
 			it.elem = re
 		}
+		// 指向下一个桶
 		it.bucket = bucket
 		if it.bptr != b { // avoid unnecessary write barrier; see issue 14921
 			it.bptr = b
