@@ -72,6 +72,9 @@ func newEntry(i interface{}) *entry {
 
 // Load操作返回存储在map中指定key的value，有两个返回值，
 // ok表示key对应的value是否存在。
+
+// 注：read的更新不总是和dirty同步的，当read的key不存在，dirty的key存在，需要加锁读取，
+// 当加锁次数足够多，才把所有dirty提升为read
 func (m *Map) Load(key interface{}) (value interface{}, ok bool) {
 	read, _ := m.read.Load().(readOnly)
 	e, ok := read.m[key]
@@ -105,6 +108,7 @@ func (e *entry) load() (value interface{}, ok bool) {
 }
 
 // 更新或者新增一个entry
+// 注：dirty总是存储比read更新的key，对于read中存在的key，只更新read的value
 func (m *Map) Store(key, value interface{}) {
 	// 情况1：如果key已经在read map存在了 且dirty map中未被删除
 	read, _ := m.read.Load().(readOnly)
@@ -125,6 +129,7 @@ func (m *Map) Store(key, value interface{}) {
 		e.storeLocked(&value)	// 情况3：如果key同时存在于read map和dirty map（mutex的影响）
 	} else if e, ok := m.dirty[key]; ok {	//情况4：如果key不在read map但存在于dirty map
 		e.storeLocked(&value)
+		// read中的数据肯定是重复store相同key的情况
 	} else {	//情况5：如果key不在read map也不存在于dirty map
 		if !read.amended {
 			// 首先判断read.amended若为false
@@ -171,6 +176,7 @@ func (e *entry) storeLocked(i *interface{}) {
 // LoadOrStore returns the existing value for the key if present.
 // Otherwise, it stores and returns the given value.
 // The loaded result is true if the value was loaded, false if stored.
+// 注：返回值loaded，true表示数据被加载，false表示数据被存储
 func (m *Map) LoadOrStore(key, value interface{}) (actual interface{}, loaded bool) {
 	// Avoid locking if it's a clean hit.
 	read, _ := m.read.Load().(readOnly)
@@ -242,6 +248,10 @@ func (e *entry) tryLoadOrStore(i interface{}) (actual interface{}, loaded, ok bo
 
 // LoadAndDelete deletes the value for a key, returning the previous value if any.
 // The loaded result reports whether the key was present.
+
+// 删除key对应的value 并返回之前的值 loaded表示key是否存在
+// 1. key不在read map但存在于dirty map，则直接调用内建delete方法从map中删除元素
+// 2. key都不存在 直接返回
 func (m *Map) LoadAndDelete(key interface{}) (value interface{}, loaded bool) {
 	read, _ := m.read.Load().(readOnly)
 	e, ok := read.m[key]
@@ -252,9 +262,7 @@ func (m *Map) LoadAndDelete(key interface{}) (value interface{}, loaded bool) {
 		if !ok && read.amended {
 			e, ok = m.dirty[key]
 			delete(m.dirty, key)
-			// Regardless of whether the entry was present, record a miss: this key
-			// will take the slow path until the dirty map is promoted to the read
-			// map.
+			// 递增misses 找准时机晋升dirty map
 			m.missLocked()
 		}
 		m.mu.Unlock()
@@ -292,6 +300,13 @@ func (e *entry) delete() (value interface{}, ok bool) {
 //
 // Range may be O(N) with the number of elements in the map even if f returns
 // false after a constant number of calls.
+
+// Range()要求一个函数f func(key, value interface{}) bool作为入参，将map中的key-value依次调用这个函数。
+// 如果函数返回false，则Range停止迭代。
+// 注：Range使用的快照，并发插入的情况下不一定准确。
+
+// 说明：如果当前dirty map中存在read map中没有的值 则先将dirty map晋升为read map，
+// 然后再依次迭代调用传入的函数 ，返回false时中断。
 func (m *Map) Range(f func(key, value interface{}) bool) {
 	// We need to be able to iterate over all of the keys that were already
 	// present at the start of the call to Range.
@@ -326,6 +341,8 @@ func (m *Map) Range(f func(key, value interface{}) bool) {
 }
 
 // Map.misses += 1, 如果misses == len(dirty) ,dirty升级为read ，然后dirty指向nil
+// 注：相等说明missed次数至少达到加锁次数，为了保证性能，把dirty全部置为read缓存
+// 这也间接说明Load()的命中key大多是新的（不存在、次数<2）Store()的key值。
 func (m *Map) missLocked() {
 	m.misses++
 	if m.misses < len(m.dirty) {
@@ -343,8 +360,9 @@ func (m *Map) dirtyLocked() {
 
 	read, _ := m.read.Load().(readOnly)
 	m.dirty = make(map[interface{}]*entry, len(read.m))
+	// 注：把read缓存数据重新写入dirty中
 	for k, e := range read.m {
-		if !e.tryExpungeLocked() {	//删除则跳过复制
+		if !e.tryExpungeLocked() {	//会把nil的值置为删除，把删除则跳过复制
 			m.dirty[k] = e	//从read map拷贝一份数据引用给到dirty map
 		}
 	}
