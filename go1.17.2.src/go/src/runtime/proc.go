@@ -378,21 +378,21 @@ func goready(gp *g, traceskip int) {
 	})
 }
 
-//go:nosplit
+// 1.如果per-P缓存的内容没达到长度的一般，则会从全局额缓存中抓取一半；
+// 2.然后返回把per-P缓存中最后一个sudog返回，并且置空；
 func acquireSudog() *sudog {
-	// Delicate dance: the semaphore implementation calls
-	// acquireSudog, acquireSudog calls new(sudog),
-	// new calls malloc, malloc can call the garbage collector,
-	// and the garbage collector calls the semaphore implementation
-	// in stopTheWorld.
-	// Break the cycle by doing acquirem/releasem around new(sudog).
-	// The acquirem/releasem increments m.locks during new(sudog),
-	// which keeps the garbage collector from being invoked.
+	// Delicate dance: 信号量的实现调用acquireSudog，然后acquireSudog调用new(sudog)
+	// new调用malloc, malloc调用垃圾收集器，垃圾收集器在stopTheWorld调用信号量
+	// 通过在new(sudog)周围执行acquirem/releasem来打破循环
+	// acquirem/releasem在new(sudog)期间增加m.locks，防止垃圾收集器被调用。
+
+	// 获取当前 g 所在的 m
 	mp := acquirem()
+	// 获取p的指针
 	pp := mp.p.ptr()
 	if len(pp.sudogcache) == 0 {
 		lock(&sched.sudoglock)
-		// First, try to grab a batch from central cache.
+		// 首先，尝试从中央缓存获取一批数据。
 		for len(pp.sudogcache) < cap(pp.sudogcache)/2 && sched.sudogcache != nil {
 			s := sched.sudogcache
 			sched.sudogcache = s.next
@@ -400,14 +400,16 @@ func acquireSudog() *sudog {
 			pp.sudogcache = append(pp.sudogcache, s)
 		}
 		unlock(&sched.sudoglock)
-		// If the central cache is empty, allocate a new one.
+		// 如果中央缓存中没有，新分配
 		if len(pp.sudogcache) == 0 {
 			pp.sudogcache = append(pp.sudogcache, new(sudog))
 		}
 	}
+	// 取缓存中最后一个
 	n := len(pp.sudogcache)
 	s := pp.sudogcache[n-1]
 	pp.sudogcache[n-1] = nil
+	// 将刚取出的在缓存中移除
 	pp.sudogcache = pp.sudogcache[:n-1]
 	if s.elem != nil {
 		throw("acquireSudog: found s.elem != nil in cache")
@@ -416,7 +418,8 @@ func acquireSudog() *sudog {
 	return s
 }
 
-//go:nosplit
+// 1、如果per-P缓存满了，就归还per-P缓存一般的内容到全局缓存；
+// 2、然后将回收的sudog放到per-P缓存中。
 func releaseSudog(s *sudog) {
 	if s.elem != nil {
 		throw("runtime: sudog with non-nil elem")
@@ -440,10 +443,12 @@ func releaseSudog(s *sudog) {
 	if gp.param != nil {
 		throw("runtime: releaseSudog with non-nil gp.param")
 	}
+	// 避免重新安排到另一个P
 	mp := acquirem() // avoid rescheduling to another P
 	pp := mp.p.ptr()
+	// 如果缓存满了
 	if len(pp.sudogcache) == cap(pp.sudogcache) {
-		// Transfer half of local cache to the central cache.
+		// 将本地高速缓存的一半传输到中央高速缓存
 		var first, last *sudog
 		for len(pp.sudogcache) > cap(pp.sudogcache)/2 {
 			n := len(pp.sudogcache)
@@ -462,6 +467,7 @@ func releaseSudog(s *sudog) {
 		sched.sudogcache = first
 		unlock(&sched.sudoglock)
 	}
+	// 归还sudog到`per-P`缓存中
 	pp.sudogcache = append(pp.sudogcache, s)
 	releasem(mp)
 }
@@ -6359,18 +6365,14 @@ func sync_atomic_runtime_procUnpin() {
 	procUnpin()
 }
 
-// Active spinning for sync.Mutex.
-//go:linkname sync_runtime_canSpin sync.runtime_canSpin
-//go:nosplit
+// 比较保守的自旋，golang中自旋锁并不会一直自旋下去
+// 在runtime包中runtime_canSpin方法做了一些限制, 传递过来的iter大等于4或者cpu核数小等于1
+// 最大逻辑处理器大于1，至少有个本地的P队列，并且本地的P队列可运行G队列为空。
 func sync_runtime_canSpin(i int) bool {
-	// sync.Mutex is cooperative, so we are conservative with spinning.
-	// Spin only few times and only if running on a multicore machine and
-	// GOMAXPROCS>1 and there is at least one other running P and local runq is empty.
-	// As opposed to runtime mutex we don't do passive spinning here,
-	// because there can be work on global runq or on other Ps.
 	if i >= active_spin || ncpu <= 1 || gomaxprocs <= int32(sched.npidle+sched.nmspinning)+1 {
 		return false
 	}
+	// 如果p的本地队列有G
 	if p := getg().m.p.ptr(); !runqempty(p) {
 		return false
 	}
@@ -6379,8 +6381,11 @@ func sync_runtime_canSpin(i int) bool {
 
 //go:linkname sync_runtime_doSpin sync.runtime_doSpin
 //go:nosplit
+// 会调用procyield函数，该函数也是汇编语言实现。
+// 函数内部循环调用PAUSE指令。
+// PAUSE指令什么都不做，但是会消耗CPU时间，在执行PAUSE指令时，CPU不会对它做不必要的优化。
 func sync_runtime_doSpin() {
-	procyield(active_spin_cnt)
+	procyield(active_spin_cnt) //忙等待就是执行 30 次 PAUSE 指令
 }
 
 var stealOrder randomOrder

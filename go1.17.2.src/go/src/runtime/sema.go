@@ -25,21 +25,29 @@ import (
 	"unsafe"
 )
 
-// Asynchronous semaphore for sync.Mutex.
+// 具体的用法是提供 sleep 和 wakeup 原语
+// 以使其能够在其它同步原语中的竞争情况下使用
+// 因此这里的 semaphore 和 Linux 中的 futex 目标是一致的
+// 只不过语义上更简单一些
+//
+// 也就是说，不要认为这些是信号量
+// 把这里的东西看作 sleep 和 wakeup 实现的一种方式
+// 每一个 sleep 都会和一个 wakeup 配对
+// 即使在发生 race 时，wakeup 在 sleep 之前时也是如此
 
-// A semaRoot holds a balanced tree of sudog with distinct addresses (s.elem).
-// Each of those sudog may in turn point (through s.waitlink) to a list
-// of other sudogs waiting on the same address.
-// The operations on the inner lists of sudogs with the same address
-// are all O(1). The scanning of the top-level semaRoot list is O(log n),
-// where n is the number of distinct addresses with goroutines blocked
-// on them that hash to the given semaRoot.
-// See golang.org/issue/17953 for a program that worked badly
-// before we introduced the second level of list, and test/locklinear.go
-// for a test that exercises this.
+
+// go/src/runtime/sema.go
+// 用于sync.Mutex的异步信号量。
+
+// semaRoot拥有一个具有不同地址（s.elem）的sudog平衡树。
+// 每个sudog都可以依次（通过s.waitlink）指向一个列表，在相同地址上等待的其他sudog。
+// 对具有相同地址的sudog内部列表进行的操作全部为O（1）。顶层semaRoot列表的扫描为O（log n），
+// 其中，n是阻止goroutines的不同地址的数量，通过他们散列到给定的semaRoot。
 type semaRoot struct {
 	lock  mutex
+	// waiters的平衡树的根节点
 	treap *sudog // root of balanced tree of unique waiters.
+	// waiters的数量，读取的时候无锁
 	nwait uint32 // Number of waiters. Read w/o the lock.
 }
 
@@ -51,7 +59,9 @@ var semtable [semTabSize]struct {
 	pad  [cpu.CacheLinePadSize - unsafe.Sizeof(semaRoot{})]byte
 }
 
-//go:linkname sync_runtime_Semacquire sync.runtime_Semacquire
+// Semacquire等待*s > 0，然后原子递减它。
+// 它是一个简单的睡眠原语，用于同步
+// library and不应该直接使用。
 func sync_runtime_Semacquire(addr *uint32) {
 	semacquire1(addr, false, semaBlockProfile, 0)
 }
@@ -61,17 +71,23 @@ func poll_runtime_Semacquire(addr *uint32) {
 	semacquire1(addr, false, semaBlockProfile, 0)
 }
 
-//go:linkname sync_runtime_Semrelease sync.runtime_Semrelease
+// Semrelease会自动增加*s并通知一个被Semacquire阻塞的等待的goroutine
+// 它是一个简单的唤醒原语，用于同步
+// library and不应该直接使用。
+// 如果handoff为true, 传递信号到队列头部的waiter
+// skipframes是跟踪过程中要省略的帧数，从这里开始计算
 func sync_runtime_Semrelease(addr *uint32, handoff bool, skipframes int) {
 	semrelease1(addr, handoff, skipframes)
 }
 
-//go:linkname sync_runtime_SemacquireMutex sync.runtime_SemacquireMutex
+// SemacquireMutex类似于Semacquire,用来阻塞互斥的对象
+// 如果lifo为true，waiter将会被插入到队列的头部
+// skipframes是跟踪过程中要省略的帧数，从这里开始计算
+// runtime_SemacquireMutex's caller.
 func sync_runtime_SemacquireMutex(addr *uint32, lifo bool, skipframes int) {
 	semacquire1(addr, lifo, semaBlockProfile|semaMutexProfile, skipframes)
 }
 
-//go:linkname poll_runtime_Semrelease internal/poll.runtime_Semrelease
 func poll_runtime_Semrelease(addr *uint32) {
 	semrelease(addr)
 }
@@ -96,6 +112,7 @@ func semacquire(addr *uint32) {
 }
 
 func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes int) {
+	// 判断这个goroutine，是否是m上正在运行的那个
 	gp := getg()
 	if gp != gp.m.curg {
 		throw("semacquire not on the G stack")
@@ -106,12 +123,13 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes i
 		return
 	}
 
-	// Harder case:
-	//	increment waiter count
-	//	try cansemacquire one more time, return if succeeded
-	//	enqueue itself as a waiter
-	//	sleep
-	//	(waiter descriptor is dequeued by signaler)
+	// 增加等待计数
+	// 再试一次 cansemacquire 如果成功则直接返回
+	// 将自己作为等待者入队
+	// 休眠
+	// (等待器描述符由出队信号产生出队行为)
+
+	// 获取一个sudog
 	s := acquireSudog()
 	root := semroot(addr)
 	t0 := int64(0)
@@ -130,17 +148,20 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes i
 	}
 	for {
 		lockWithRank(&root.lock, lockRankRoot)
-		// Add ourselves to nwait to disable "easy case" in semrelease.
+		// 添加我们自己到nwait来禁用semrelease中的"easy case"
 		atomic.Xadd(&root.nwait, 1)
-		// Check cansemacquire to avoid missed wakeup.
+		// 检查cansemacquire避免错过唤醒
 		if cansemacquire(addr) {
 			atomic.Xadd(&root.nwait, -1)
 			unlock(&root.lock)
 			break
 		}
-		// Any semrelease after the cansemacquire knows we're waiting
-		// (we set nwait above), so go to sleep.
+		// 任何在 cansemacquire 之后的 semrelease 都知道我们在等待（因为设置了 nwait），因此休眠
+
+		// 队列将s添加到semaRoot中被阻止的goroutine中
 		root.queue(addr, s, lifo)
+		// 将当前goroutine置于等待状态并解锁锁。
+		// 通过调用goready（gp），可以使goroutine再次可运行。
 		goparkunlock(&root.lock, waitReasonSemacquire, traceEvGoBlockSync, 4+skipframes)
 		if s.ticket != 0 || cansemacquire(addr) {
 			break
@@ -149,6 +170,7 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags, skipframes i
 	if s.releasetime > 0 {
 		blockevent(s.releasetime-t0, 3+skipframes)
 	}
+	// 归还sudog
 	releaseSudog(s)
 }
 
@@ -160,27 +182,27 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 	root := semroot(addr)
 	atomic.Xadd(addr, 1)
 
-	// Easy case: no waiters?
-	// This check must happen after the xadd, to avoid a missed wakeup
-	// (see loop in semacquire).
+	// Easy case:没有等待者
+	// 这个检查必须发生在xadd之后，以避免错过唤醒
 	if atomic.Load(&root.nwait) == 0 {
 		return
 	}
 
-	// Harder case: search for a waiter and wake it.
+	// Harder case: 找到等待者，并且唤醒
 	lockWithRank(&root.lock, lockRankRoot)
 	if atomic.Load(&root.nwait) == 0 {
-		// The count is already consumed by another goroutine,
-		// so no need to wake up another goroutine.
+		// 该计数已被另一个goroutine占用，
+		// 因此无需唤醒其他goroutine。
 		unlock(&root.lock)
 		return
 	}
+	// 搜索一个等待着然后将其唤醒
 	s, t0 := root.dequeue(addr)
 	if s != nil {
 		atomic.Xadd(&root.nwait, -1)
 	}
 	unlock(&root.lock)
-	if s != nil { // May be slow or even yield, so unlock first
+	if s != nil { // 可能会很慢，因此先解锁
 		acquiretime := s.acquiretime
 		if acquiretime != 0 {
 			mutexevent(t0-acquiretime, 3+skipframes)
@@ -191,6 +213,8 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 		if handoff && cansemacquire(addr) {
 			s.ticket = 1
 		}
+		// goready(s.g, 5)
+		// 标记 runnable，等待被重新调度
 		readyWithTime(s, 5+skipframes)
 		if s.ticket == 1 && getg().m.locks == 0 {
 			// Direct G handoff

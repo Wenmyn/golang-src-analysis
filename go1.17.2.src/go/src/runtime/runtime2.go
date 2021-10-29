@@ -331,38 +331,29 @@ type gobuf struct {
 	bp   uintptr // for framepointer-enabled architectures
 }
 
-// sudog represents a g in a wait list, such as for sending/receiving
-// on a channel.
-//
-// sudog is necessary because the g ↔ synchronization object relation
-// is many-to-many. A g can be on many wait lists, so there may be
-// many sudogs for one g; and many gs may be waiting on the same
-// synchronization object, so there may be many sudogs for one object.
-//
-// sudogs are allocated from a special pool. Use acquireSudog and
-// releaseSudog to allocate and free them.
-type sudog struct {
-	// The following fields are protected by the hchan.lock of the
-	// channel this sudog is blocking on. shrinkstack depends on
-	// this for sudogs involved in channel ops.
+// sudog 是运行时用来存放处于阻塞状态的goroutine的一个上层抽象，
+// 是用来实现用户态信号量的主要机制之一。
 
+// 例如当一个goroutine因为等待channel的数据需要进行阻塞时，
+// sudog会将goroutine及其用于等待数据的位置进行记录， 并进而串联成一个等待队列，或二叉平衡树。
+type sudog struct {
+	// 以下字段受hchan保护
 	g *g
 
 	next *sudog
 	prev *sudog
-	elem unsafe.Pointer // data element (may point to stack)
+	elem unsafe.Pointer // 数据元素（可能指向栈）
 
-	// The following fields are never accessed concurrently.
-	// For channels, waitlink is only accessed by g.
-	// For semaphores, all fields (including the ones above)
-	// are only accessed when holding a semaRoot lock.
-
+	// 以下字段不会并发访问。
+	// 对于通道，waitlink只被g访问。
+	// 对于信号量，所有字段(包括上面的字段)
+	// 只有当持有一个semroot锁时才被访问。
 	acquiretime int64
 	releasetime int64
 	ticket      uint32
 
-	// isSelect indicates g is participating in a select, so
-	// g.selectDone must be CAS'd to win the wake-up race.
+	// isSelect 表示 g 正在参与一个 select, so
+	// 因此 g.selectDone 必须以 CAS 的方式来获取wake-up race.
 	isSelect bool
 
 	// success indicates whether communication over channel c
@@ -371,8 +362,8 @@ type sudog struct {
 	// because c was closed.
 	success bool
 
-	parent   *sudog // semaRoot binary tree
-	waitlink *sudog // g.waiting list or semaRoot
+	parent   *sudog //semaRoot 二叉树
+	waitlink *sudog // g.waiting 列表或 semaRoot
 	waittail *sudog // semaRoot
 	c        *hchan // channel
 }
@@ -742,33 +733,50 @@ type p struct {
 	// that its size class is an integer multiple of the cache line size (for any of our architectures).
 }
 
+// 作为Go调度器，它维护了有存储M和G的队列以及调度器的一些状态信息等，全局调度时使用。
 type schedt struct {
 	// accessed atomically. keep at top to ensure alignment on 32-bit systems.
+	// 原子访问, 最顶部，保证32位系统下的对齐
 	goidgen   uint64
+	// 上次网络轮询的时间,如果当前正在轮询,则为0
 	lastpoll  uint64 // time of last network poll, 0 if currently polling
+	// 当前轮询休眠的时间
 	pollUntil uint64 // time to which current poll is sleeping
 
 	lock mutex
 
 	// When increasing nmidle, nmidlelocked, nmsys, or nmfreed, be
 	// sure to call checkdead().
+	// 当增加 nmidle，nmidlelocked, nmsys或 nmfreed 的时候，一定要调用 checkdead()
 
+	// 空闲m等待队列
 	midle        muintptr // idle m's waiting for work
+	// 空闲m的数量
 	nmidle       int32    // number of idle m's waiting for work
+	// 等待工作的锁定m的数量
 	nmidlelocked int32    // number of locked m's waiting for work
+	// 已创建的m数和下一个m ID, 一个字段代表两个意义？
 	mnext        int64    // number of m's that have been created and next M ID
+	// 允许的最大m数
 	maxmcount    int32    // maximum number of m's allowed (or die)
+	// 死锁不计算系统m的数量
 	nmsys        int32    // number of system m's not counted for deadlock
+	// 累计已释放m的数量
 	nmfreed      int64    // cumulative number of freed m's
 
+	// 系统goroutins的数量，原子更新
 	ngsys uint32 // number of system goroutines; updated atomically
 
+	// 空闲p
 	pidle      puintptr // idle p's
 	npidle     uint32
+	// 是否处于自旋状态（0：没有）, 查看proc.go 文件的 "Worker thread parking/unparking" 注释
 	nmspinning uint32 // See "Worker thread parking/unparking" comment in proc.go.
 
 	// Global runnable queue.
+	// 全局运行队列信息, gQueue 是一个通过 g.schedlink 链接的双向队列
 	runq     gQueue
+	// 队列大小
 	runqsize int32
 
 	// disable controls selective disabling of the scheduler.
@@ -801,8 +809,10 @@ type schedt struct {
 
 	// freem is the list of m's waiting to be freed when their
 	// m.exited is set. Linked through m.freelink.
+	// freem 是当 他们的 m.exited 被设置时的等待被释放m列表，通过 m.freelink 链接
 	freem *m
 
+	// gc正在等待运行
 	gcwaiting  uint32 // gc is waiting to run
 	stopwait   int32
 	stopnote   note

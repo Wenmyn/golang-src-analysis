@@ -47,8 +47,6 @@ func init() {
 	runtime_notifyListCheck(unsafe.Sizeof(n))
 }
 
-// Active spinning runtime support.
-// runtime_canSpin reports whether spinning makes sense at the moment.
 func runtime_canSpin(i int) bool
 
 // runtime_doSpin does active spinning.
