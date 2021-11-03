@@ -226,9 +226,9 @@ func panicmemAddr(addr uintptr) {
 	panic(errorAddressString{msg: "invalid memory address or nil pointer dereference", addr: addr})
 }
 
-// Create a new deferred function fn with siz bytes of arguments.
-// The compiler turns a defer statement into a call to this.
-//go:nosplit
+// 1.当延迟函数中recover了一个panic时，就会返回1
+// 2.当 runtime.deferproc 函数的返回值是 1 时，编译器生成的代码会直接跳转到调用方函数返回之前并执行 runtime.deferreturn，
+// 跳转到 runtime.deferturn 函数之后，程序就已经从panic恢复了正常的逻辑。
 func deferproc(siz int32, fn *funcval) { // arguments of fn follow fn
 	gp := getg()
 	if gp.m.curg != gp {
@@ -956,6 +956,9 @@ func deferCallSave(p *_panic, fn func()) {
 
 // The implementation of the predeclared function panic.
 func gopanic(e interface{}) {
+
+	// 第一部分，判断panic类型：
+	// 根据不同的类型判断当前发生panic错误，这里没什么多说的，接着往下看。
 	gp := getg()
 	if gp.m.curg != gp {
 		print("panic: ")
@@ -986,9 +989,12 @@ func gopanic(e interface{}) {
 		throw("panic holding locks")
 	}
 
-	var p _panic
-	p.arg = e
-	p.link = gp._panic
+	// 第二部分，确保每个recover都试图恢复当前协程中最新产生的且尚未恢复的panic
+
+	// 插入队头
+	var p _panic  // 声明一个panic结构
+	p.arg = e	  // 把panic传入的值赋给`arg`
+	p.link = gp._panic	// 指向runtime.panic结构
 	gp._panic = (*_panic)(noescape(unsafe.Pointer(&p)))
 
 	atomic.Xadd(&runningPanicDefers, 1)
@@ -998,19 +1004,23 @@ func gopanic(e interface{}) {
 	addOneOpenDeferFrame(gp, getcallerpc(), unsafe.Pointer(getcallersp()))
 
 	for {
-		d := gp._defer
+		d := gp._defer	// 获取当前gorourine的 defer
 		if d == nil {
-			break
+			break		// 如果没有defer直接退出了
 		}
 
-		// If defer was started by earlier panic or Goexit (and, since we're back here, that triggered a new panic),
-		// take defer off list. An earlier panic will not continue running, but we will make sure below that an
-		// earlier Goexit does continue running.
+		// 1.直接看 d.Started部分，这里的意思是如果defer是由先前的panic或Goexit启动的
+		// (循环处理回到这里，这触发了新的panic)，将defer从列表中删除。
+		// 2.早期的panic将不会继续运行，但我们将确保早期的Goexit会继续运行，
+		// 代码中的if d._panic != nil{d._panic.aborted =true}
+		// 就是确保将先前的panic终止掉，将aborted设置为true，在下面执行recover时保证goexit不会被取消。
 		if d.started {
 			if d._panic != nil {
 				d._panic.aborted = true
 			}
 			d._panic = nil
+
+			// 第三部分，defer内联优化调用性能
 			if !d.openDefer {
 				// For open-coded defers, we need to process the
 				// defer again, in case there are any other defers
@@ -1034,6 +1044,7 @@ func gopanic(e interface{}) {
 		d._panic = (*_panic)(noescape(unsafe.Pointer(&p)))
 
 		done := true
+		// 判断当前defer是否可以使用开发编码模式，具体怎么操作的就不展开了。
 		if d.openDefer {
 			done = runOpenDeferFrame(gp, d)
 			if done && !d._panic.recovered {
@@ -1049,6 +1060,9 @@ func gopanic(e interface{}) {
 				// Pass a dummy RegArgs since we'll only take this path if
 				// we're not using the register ABI.
 				var regs abi.RegArgs
+				// 在第三部分进行defer内联优化选择时会执行调用延迟函数(reflectcall就是这个作用)，
+				// 也就是会调用runtime.gorecover把recoverd = true
+				// 注：runtime.gorecover函数并不包含恢复程序的逻辑，程序的恢复是在gopanic中执行的。
 				reflectcall(nil, unsafe.Pointer(d.fn), deferArgs(d), uint32(d.siz), uint32(d.siz), uint32(d.siz), &regs)
 			}
 		}
@@ -1070,8 +1084,13 @@ func gopanic(e interface{}) {
 			gp._defer = d.link
 			freedefer(d)
 		}
+		// 第四部分，gopanic中执行程序恢复
+		// 在runtime.gorecover中设置为true
 		if p.recovered {
 			gp._panic = p.link
+			// 第1部分：正常recover是会绕过Goexit的，所以为了解决这个，添加了这个判断，
+			// 这样就可以保证Goexit也会被recover住，这里是通过从runtime._panic中取出了程序计数器pc和栈指针sp
+			// 并且调用runtime.recovery函数触发goroutine的调度，调度之前会准备好 sp、pc 以及函数的返回值。
 			if gp._panic != nil && gp._panic.goexit && gp._panic.aborted {
 				// A normal recover would bypass/abort the Goexit.  Instead,
 				// we return to the processing loop of the Goexit.
@@ -1144,8 +1163,14 @@ func gopanic(e interface{}) {
 	// and String methods to prepare the panic strings before startpanic.
 	preprintpanics(gp._panic)
 
+	// 第五部分，如果没有遇到runtime.gorecover就会依次便利所有的runtime._defer，
+	// 在最后调用fatalpanic中止程序，并打印panic参数返回错误码2。
+
+	// 在这里runtime.fatalpanic实现了无法被恢复的程序崩溃，
+	// 它在中止程序之前会通过 runtime.printpanics 打印出全部的 panic 消息以及调用时传入的参数。
 	fatalpanic(gp._panic) // should not return
 	*(*int)(nil) = 0      // not reached
+
 }
 
 // getargp returns the location where the caller
@@ -1164,14 +1189,17 @@ func getargp() uintptr {
 // this doesn't need to be nosplit.
 //go:nosplit
 func gorecover(argp uintptr) interface{} {
-	// Must be in a function running as part of a deferred call during the panic.
-	// Must be called from the topmost function of the call
-	// (the function used in the defer statement).
-	// p.argp is the argument pointer of that topmost deferred function call.
-	// Compare against argp reported by caller.
-	// If they match, the caller is the one who can recover.
+
 	gp := getg()
 	p := gp._panic
+	// 1.首先获取当前所在的Goroutine，如果当前Goroutine没有调用panic，那么该函数会直接返回nil
+	// 2.是否能recover住该panic的判断条间必须四个都吻合，
+	// (1) p.Goexit判断当前是否是goexit触发的，
+	// -如果是则无法revocer住，上面讲过会在gopanic中执行进行recover。
+	// (2) argp是是最顶层延迟函数调用的实参指针，与调用者的argp进行比较，
+	// -如果匹配说明调用者是可以recover，直接将recovered字段设置为true就可以了。
+
+	// 注：这里主要的作用就是判断当前panic是否可以recover，具体的恢复逻辑还是由gopanic函数负责的。
 	if p != nil && !p.goexit && !p.recovered && argp == uintptr(p.argp) {
 		p.recovered = true
 		return p.arg
@@ -1212,9 +1240,12 @@ var panicking uint32
 // so that two concurrent panics don't overlap their output.
 var paniclk mutex
 
-// Unwind the stack after a deferred function calls recover
-// after a panic. Then arrange to continue running as though
-// the caller of the deferred function returned normally.
+// 第2部分: 主要是做panic的recover，这也与上面的流程基本差不多
+// 他是从runtime._defer中取出了程序计数器pc和栈指针sp并调用recovery函数触发Goroutine，
+// 跳转到recovery函数是通过runtime.call进行的，我们看一下其源码(src/runtime/asm_amd64.s 289行)：
+
+// 因为go语言中的runtime环境是有自己的堆栈和goroutine
+// recovery函数也是在runtime环境执行的，所以要调度到m->g0来执行recovery函数
 func recovery(gp *g) {
 	// Info about defer passed in G struct.
 	sp := gp.sigcode0
@@ -1226,9 +1257,9 @@ func recovery(gp *g) {
 		throw("bad recovery")
 	}
 
-	// Make the deferproc for this d return again,
-	// this time returning 1. The calling function will
-	// jump to the standard return epilogue.
+	// 1.在recovery 函数中，利用 g 中的两个状态码回溯栈指针 sp 并恢复程序计数器 pc 到调度器中，
+	// 并调用 gogo 重新调度 g ，将 g 恢复到调用 recover 函数的位置。
+	// 2.goroutine 继续执行，recovery在调度过程中会将函数的返回值设置为1。
 	gp.sched.sp = sp
 	gp.sched.pc = pc
 	gp.sched.lr = 0
@@ -1263,11 +1294,7 @@ func fatalthrow() {
 	*(*int)(nil) = 0 // not reached
 }
 
-// fatalpanic implements an unrecoverable panic. It is like fatalthrow, except
-// that if msgs != nil, fatalpanic also prints panic messages and decrements
-// runningPanicDefers once main is blocked from exiting.
 //
-//go:nosplit
 func fatalpanic(msgs *_panic) {
 	pc := getcallerpc()
 	sp := getcallersp()

@@ -977,22 +977,22 @@ type _defer struct {
 	framepc uintptr
 }
 
-// A _panic holds information about an active panic.
+//-说明：
+// 1.runtime包中有一个Goexit方法，Goext能够终止调用它的goroutine，其他的goroutine是不受影响的
+// 2.goexit也会在终止goroutine之前运行所有延迟调用函数，Goexit不是一个panic，所以这些延迟函数中的任何recover调用都将返回nil。
+// 3.如果我们在主函数中调用了Goexit会终止该goroutine但不会返回func main。
+// 由于func main没有返回，因此程序将继续执行其他gorountine，直到所有其他goroutine退出，程序才会crash。
 //
-// A _panic value must only ever live on the stack.
 //
-// The argp and link fields are stack pointers, but don't need special
-// handling during stack growth: because they are pointer-typed and
-// _panic values only live on the stack, regular stack pointer
-// adjustment takes care of them.
+//
 type _panic struct {
-	argp      unsafe.Pointer // pointer to arguments of deferred call run during panic; cannot move - known to liblink
-	arg       interface{}    // argument to panic
-	link      *_panic        // link to earlier panic
+	argp      unsafe.Pointer // argp是指向defer调用时参数的指针。
+	arg       interface{}    // arg是我们调用panic时传入的参数
+	link      *_panic        // link指向的是更早调用runtime._panic结构，也就是说painc可以被连续调用，他们之间形成链表
 	pc        uintptr        // where to return to in runtime if this panic is bypassed
 	sp        unsafe.Pointer // where to return to in runtime if this panic is bypassed
-	recovered bool           // whether this panic is over
-	aborted   bool           // the panic was aborted
+	recovered bool           // 表示当前runtime._panic是否被recover恢复
+	aborted   bool           // 表示当前的panic是否被强行终止
 	goexit    bool
 }
 
