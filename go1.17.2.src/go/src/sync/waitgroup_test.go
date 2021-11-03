@@ -118,7 +118,7 @@ func TestWaitGroupMisuse2(t *testing.T) {
 			}()
 			atomic.AddUint32(&here, 1)
 			pollUntilEqual(&here, 3)
-			wg.Add(1) // This is the bad guy.
+			wg.Add(1) // This is the bad guy. //对应情况3
 			wg.Done()
 		}()
 		atomic.AddUint32(&here, 1)
@@ -165,6 +165,7 @@ func TestWaitGroupMisuse3(t *testing.T) {
 			}()
 			wg.Wait()
 			// Start reusing the wg before waiting for the Wait below to return.
+			// 在wait之前add，意味着done永远不会为0，wait会一直阻塞.
 			wg.Add(1)
 			go func() {
 				wg.Done()
