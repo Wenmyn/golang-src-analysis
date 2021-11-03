@@ -172,7 +172,7 @@ func propagateCancel(parent Context, child canceler) {
 	default:
 	}
 
-	if p, ok := parentCancelCtx(parent); ok {	// 找到一个 是cancelCtx 实例
+	if p, ok := parentCancelCtx(parent); ok {	// 找到第一个 是cancelCtx 实例
 		p.mu.Lock()
 		if p.err != nil {
 			// 父节点已经被取消
@@ -358,6 +358,7 @@ func WithDeadline(parent Context, d time.Time) (Context, CancelFunc) {
 	propagateCancel(parent, c)	// 构建 Context 取消树，注意传入的是 c 而非 c.cancelCtx
 	dur := time.Until(d)		// 测试时限是否设的太近以至于已经结束了
 	if dur <= 0 {
+		// 已经过期
 		c.cancel(true, DeadlineExceeded) // deadline has already passed
 		return c, func() { c.cancel(false, Canceled) }
 	}
@@ -366,9 +367,11 @@ func WithDeadline(parent Context, d time.Time) (Context, CancelFunc) {
 	defer c.mu.Unlock()
 	if c.err == nil {
 		c.timer = time.AfterFunc(dur, func() {
+			// 构建一个timer定时器，到期后自动调用cancel取消
 			c.cancel(true, DeadlineExceeded)
 		})
 	}
+	// 返回取消函数
 	return c, func() { c.cancel(true, Canceled) }
 }
 
