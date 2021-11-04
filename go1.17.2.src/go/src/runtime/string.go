@@ -133,20 +133,7 @@ func rawstringtmp(buf *tmpBuf, l int) (s string, b []byte) {
 	return
 }
 
-// slicebytetostringtmp returns a "string" referring to the actual []byte bytes.
-//
-// Callers need to ensure that the returned string will not be used after
-// the calling goroutine modifies the original slice or synchronizes with
-// another goroutine.
-//
-// The function is only called when instrumenting
-// and otherwise intrinsified by the compiler.
-//
-// Some internal compiler optimizations use this function.
-// - Used for m[T1{... Tn{..., string(k), ...} ...}] and m[string(k)]
-//   where k is []byte, T1 to Tn is a nesting of struct and array literals.
-// - Used for "<"+string(b)+">" concatenation where b is []byte.
-// - Used for string(b)=="foo" comparison where b is []byte.
+
 func slicebytetostringtmp(ptr *byte, n int) (str string) {
 	if raceenabled && n > 0 {
 		racereadrangepc(unsafe.Pointer(ptr),
@@ -226,8 +213,8 @@ func slicerunetostring(buf *tmpBuf, a []rune) string {
 }
 
 type stringStruct struct {
-	str unsafe.Pointer
-	len int
+	str unsafe.Pointer 	// 对应到字符串的首地址
+	len int	// 字符串的字节长度
 }
 
 // Variant with *byte pointer type for DWARF debugging.
@@ -459,8 +446,8 @@ func findnullw(s *uint16) int {
 
 //go:nosplit
 func gostringnocopy(str *byte) string {
-	ss := stringStruct{str: unsafe.Pointer(str), len: findnull(str)}
-	s := *(*string)(unsafe.Pointer(&ss))
+	ss := stringStruct{str: unsafe.Pointer(str), len: findnull(str)} // 构建成 stringStruct
+	s := *(*string)(unsafe.Pointer(&ss)) // 强转成 string
 	return s
 }
 

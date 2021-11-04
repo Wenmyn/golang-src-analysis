@@ -65,9 +65,9 @@ type complex64 complex64
 // imaginary parts.
 type complex128 complex128
 
-// string is the set of all strings of 8-bit bytes, conventionally but not
-// necessarily representing UTF-8-encoded text. A string may be empty, but
-// not nil. Values of string type are immutable.
+// 字符串这个类型，是所有8-bits 字符串的集合，通常但不一定表示utf -8编码的文本
+// 字符串可以为空，但不能为 nil ，此处的字符串为空是 ""
+// 字符串类型的值是不可变的
 type string string
 
 // int is a signed integer type that is at least 32 bits in size. It is a
@@ -82,9 +82,7 @@ type uint uint
 // any pointer.
 type uintptr uintptr
 
-// byte is an alias for uint8 and is equivalent to uint8 in all ways. It is
-// used, by convention, to distinguish byte values from 8-bit unsigned
-// integer values.
+// byte就是uint8的别名，它是用来区分字节值和8位无符号整数值。
 type byte = uint8
 
 // rune is an alias for int32 and is equivalent to int32 in all ways. It is
