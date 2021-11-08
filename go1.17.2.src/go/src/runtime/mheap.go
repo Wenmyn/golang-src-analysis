@@ -60,48 +60,18 @@ const (
 //
 //go:notinheap
 type mheap struct {
-	// lock must only be acquired on the system stack, otherwise a g
-	// could self-deadlock if its stack grows with the lock held.
-	lock  mutex
+	lock  mutex	// 互斥锁
 	pages pageAlloc // page allocation data structure
 
-	sweepgen     uint32 // sweep generation, see comment in mspan; written during STW
-	sweepDrained uint32 // all spans are swept or are being swept
-	sweepers     uint32 // number of active sweepone calls
+	sweepgen     uint32	// GC相关
+	sweepDrained uint32	// GC相关
+	sweepers     uint32	// GC相关
 
-	// allspans is a slice of all mspans ever created. Each mspan
-	// appears exactly once.
-	//
-	// The memory for allspans is manually managed and can be
-	// reallocated and move as the heap grows.
-	//
-	// In general, allspans is protected by mheap_.lock, which
-	// prevents concurrent access as well as freeing the backing
-	// store. Accesses during STW might not hold the lock, but
-	// must ensure that allocation cannot happen around the
-	// access (since that may free the backing store).
-	allspans []*mspan // all spans out there
+	// spans: 指向mspans区域，用于映射mspan和page的关系
+	allspans []*mspan // 所有申请的span
 
 	_ uint32 // align uint64 fields on 32-bit for atomics
 
-	// Proportional sweep
-	//
-	// These parameters represent a linear function from gcController.heapLive
-	// to page sweep count. The proportional sweep system works to
-	// stay in the black by keeping the current page sweep count
-	// above this line at the current gcController.heapLive.
-	//
-	// The line has slope sweepPagesPerByte and passes through a
-	// basis point at (sweepHeapLiveBasis, pagesSweptBasis). At
-	// any given time, the system is at (gcController.heapLive,
-	// pagesSwept) in this space.
-	//
-	// It's important that the line pass through a point we
-	// control rather than simply starting at a (0,0) origin
-	// because that lets us adjust sweep pacing at any time while
-	// accounting for current progress. If we could only adjust
-	// the slope, it would create a discontinuity in debt if any
-	// progress has already been made.
 	pagesInUse         uint64  // pages of spans in stats mSpanInUse; updated atomically
 	pagesSwept         uint64  // pages swept this cycle; updated atomically
 	pagesSweptBasis    uint64  // pagesSwept to use as the origin of the sweep ratio; updated atomically
@@ -183,7 +153,7 @@ type mheap struct {
 	// sweepArenas is a snapshot of allArenas taken at the
 	// beginning of the sweep cycle. This can be read safely by
 	// simply blocking GC (by disabling preemption).
-	sweepArenas []arenaIdx
+	sweepArenas []arenaIdx	// GC相关
 
 	// markArenas is a snapshot of allArenas taken at the beginning
 	// of the mark cycle. Because allArenas is append-only, neither
@@ -199,11 +169,8 @@ type mheap struct {
 
 	_ uint32 // ensure 64-bit alignment of central
 
-	// central free lists for small size classes.
-	// the padding makes sure that the mcentrals are
-	// spaced CacheLinePadSize bytes apart, so that each mcentral.lock
-	// gets its own cache line.
-	// central is indexed by spanClass.
+	// mcentral 内存分配中心，mcache没有足够的内存分配的时候，会从mcentral分配
+	// mcentral 是mheap在管理
 	central [numSpanClasses]struct {
 		mcentral mcentral
 		pad      [cpu.CacheLinePadSize - unsafe.Sizeof(mcentral{})%cpu.CacheLinePadSize]byte
@@ -382,12 +349,13 @@ type mSpanList struct {
 
 //go:notinheap
 type mspan struct {
-	next *mspan     // next span in list, or nil if none
-	prev *mspan     // previous span in list, or nil if none
+	next *mspan     // 链表前向指针，用于将span链接起来
+	prev *mspan     // 链表前向指针，用于将span链接起来
+
 	list *mSpanList // For debugging. TODO: Remove.
 
-	startAddr uintptr // address of first byte of span aka s.base()
-	npages    uintptr // number of pages in span
+	startAddr uintptr // 起始地址，也即所管理页的地址
+	npages    uintptr // 管理的页数
 
 	manualFreeList gclinkptr // list of free objects in mSpanManual spans
 
@@ -409,7 +377,7 @@ type mspan struct {
 	freeindex uintptr
 	// TODO: Look up nelems from sizeclass and remove this field if it
 	// helps performance.
-	nelems uintptr // number of object in the span.
+	nelems uintptr // 块个数，表示有多少个块可供分配
 
 	// Cache of the allocBits at freeindex. allocCache is shifted
 	// such that the lowest bit corresponds to the bit freeindex.
@@ -441,7 +409,7 @@ type mspan struct {
 	// The sweep will free the old allocBits and set allocBits to the
 	// gcmarkBits. The gcmarkBits are replaced with a fresh zeroed
 	// out memory.
-	allocBits  *gcBits
+	allocBits  *gcBits	//分配位图，每一位代表一个块是否已分配
 	gcmarkBits *gcBits
 
 	// sweep generation:
@@ -454,11 +422,11 @@ type mspan struct {
 
 	sweepgen    uint32
 	divMul      uint32        // for divide by elemsize
-	allocCount  uint16        // number of allocated objects
-	spanclass   spanClass     // size class and noscan (uint8)
+	allocCount  uint16        // 已分配块的个数
+	spanclass   spanClass     // class表中的class ID，和Size Classs相关
 	state       mSpanStateBox // mSpanInUse etc; accessed atomically (get/set methods)
 	needzero    uint8         // needs to be zeroed before allocation
-	elemsize    uintptr       // computed from sizeclass or from npages
+	elemsize    uintptr       // class表中的对象大小，也即块大小
 	limit       uintptr       // end of data in span
 	speciallock mutex         // guards specials list
 	specials    *special      // linked list of special records sorted by offset.
@@ -908,8 +876,10 @@ func (h *mheap) alloc(npages uintptr, spanclass spanClass, needzero bool) (*mspa
 		// To prevent excessive heap growth, before allocating n pages
 		// we need to sweep and reclaim at least n pages.
 		if !isSweepDone() {
+			// 为了阻止内存的大量占用和堆的增长，我们在分配对应页数的内存前需要先调用 runtime.mheap.reclaim 方法回收一部分内存
 			h.reclaim(npages)
 		}
+		//从mheap申请一个mspan
 		s = h.allocSpan(npages, spanAllocHeap, spanclass)
 	})
 
@@ -1129,8 +1099,8 @@ func (h *mheap) freeMSpanLocked(s *mspan) {
 //go:systemstack
 func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass) (s *mspan) {
 	// Function-global state.
-	gp := getg()
-	base, scav := uintptr(0), uintptr(0)
+	gp := getg()	// 获取当前协程
+	base, scav := uintptr(0), uintptr(0)  // 基址，回收地址(bit位)
 
 	// On some platforms we need to provide physical page aligned stack
 	// allocations. Where the page size is less than the physical page
@@ -1141,19 +1111,26 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 	// The page cache does not support aligned allocations, so we cannot use
 	// it if we need to provide a physical page aligned stack allocation.
 	pp := gp.m.p.ptr()
+	// 当申请页数小于 8*64/4=128时从P的pageCache申请【pageCache后续会介绍】
+	// 注意pageCache是连续的
 	if !needPhysPageAlign && pp != nil && npages < pageCachePages/4 {
 		c := &pp.pcache
 
 		// If the cache is empty, refill it.
+		// p对应的pageCache为空，则申请cache内存 --- pageCache下面会讲解
 		if c.empty() {
 			lock(&h.lock)
+			// 填充本地的pageCache
 			*c = h.pages.allocToCache()
 			unlock(&h.lock)
 		}
 
 		// Try to allocate from the cache.
-		base, scav = c.alloc(npages)
+		// 1、先从p的页缓存获取内存区域的基地址和大小
+		base, scav = c.alloc(npages)	// 下面会讲解
+		// 申请成功
 		if base != 0 {
+			// 对应span
 			s = h.tryAllocMSpan()
 			if s != nil {
 				goto HaveSpan
@@ -1171,16 +1148,17 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 		// Overallocate by a physical page to allow for later alignment.
 		npages += physPageSize / pageSize
 	}
-
+	// 2、P的页缓存没有足够的内存，则在页堆上申请内存
 	if base == 0 {
 		// Try to acquire a base address.
+		// mheap全局堆区
 		base, scav = h.pages.alloc(npages)
 		if base == 0 {
-			if !h.grow(npages) {
+			if !h.grow(npages) { // 从系统申请固定页数大小的内存区域
 				unlock(&h.lock)
 				return nil
 			}
-			base, scav = h.pages.alloc(npages)
+			base, scav = h.pages.alloc(npages)	//重新从mheap获取
 			if base == 0 {
 				throw("grew heap, but no adequate free space found")
 			}

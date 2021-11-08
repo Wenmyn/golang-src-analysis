@@ -791,18 +791,7 @@ nextLevel:
 	return addr, p.findMappedAddr(firstFree.base)
 }
 
-// alloc allocates npages worth of memory from the page heap, returning the base
-// address for the allocation and the amount of scavenged memory in bytes
-// contained in the region [base address, base address + npages*pageSize).
-//
-// Returns a 0 base address on failure, in which case other returned values
-// should be ignored.
-//
-// p.mheapLock must be held.
-//
-// Must run on the system stack because p.mheapLock must be held.
-//
-//go:systemstack
+// 申请pageCache
 func (p *pageAlloc) alloc(npages uintptr) (addr uintptr, scav uintptr) {
 	assertLockHeld(p.mheapLock)
 
@@ -834,6 +823,7 @@ func (p *pageAlloc) alloc(npages uintptr) (addr uintptr, scav uintptr) {
 	// the slow path.
 	addr, searchAddr = p.find(npages)
 	if addr == 0 {
+		// 页数为1
 		if npages == 1 {
 			// We failed to find a single free page, the smallest unit
 			// of allocation. This means we know the heap is completely

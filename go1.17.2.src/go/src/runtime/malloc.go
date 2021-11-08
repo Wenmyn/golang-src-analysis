@@ -858,15 +858,7 @@ func nextFreeFast(s *mspan) gclinkptr {
 	return 0
 }
 
-// nextFree returns the next free object from the cached span if one is available.
-// Otherwise it refills the cache with a span with an available object and
-// returns that object along with a flag indicating that this was a heavy
-// weight allocation. If it is a heavy weight allocation the caller must
-// determine whether a new GC cycle needs to be started or if the GC is active
-// whether this goroutine needs to assist the GC.
-//
-// Must run in a non-preemptible context since otherwise the owner of
-// c could change.
+// 在mache申请空闲内存
 func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bool) {
 	s = c.alloc[spc]
 	shouldhelpgc = false
@@ -877,10 +869,10 @@ func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bo
 			println("runtime: s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
 			throw("s.allocCount != s.nelems && freeIndex == s.nelems")
 		}
-		c.refill(spc)
+		c.refill(spc)	// 这个地方 mcache 向 mcentral 申请
 		shouldhelpgc = true
 		s = c.alloc[spc]
-
+		// mcache 向 mcentral 申请完之后，再次从 mcache 申请
 		freeIndex = s.nextFreeIndex()
 	}
 
@@ -982,40 +974,14 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	// In some cases block zeroing can profitably (for latency reduction purposes)
 	// be delayed till preemption is possible; isZeroed tracks that state.
 	isZeroed := true
+	// size <= 32KB
 	if size <= maxSmallSize {
+		// tiny对象的内存分配 < 16B
 		if noscan && size < maxTinySize {
-			// Tiny allocator.
-			//
-			// Tiny allocator combines several tiny allocation requests
-			// into a single memory block. The resulting memory block
-			// is freed when all subobjects are unreachable. The subobjects
-			// must be noscan (don't have pointers), this ensures that
-			// the amount of potentially wasted memory is bounded.
-			//
-			// Size of the memory block used for combining (maxTinySize) is tunable.
-			// Current setting is 16 bytes, which relates to 2x worst case memory
-			// wastage (when all but one subobjects are unreachable).
-			// 8 bytes would result in no wastage at all, but provides less
-			// opportunities for combining.
-			// 32 bytes provides more opportunities for combining,
-			// but can lead to 4x worst case wastage.
-			// The best case winning is 8x regardless of block size.
-			//
-			// Objects obtained from tiny allocator must not be freed explicitly.
-			// So when an object will be freed explicitly, we ensure that
-			// its size >= maxTinySize.
-			//
-			// SetFinalizer has a special case for objects potentially coming
-			// from tiny allocator, it such case it allows to set finalizers
-			// for an inner byte of a memory block.
-			//
-			// The main targets of tiny allocator are small strings and
-			// standalone escaping variables. On a json benchmark
-			// the allocator reduces number of allocations by ~12% and
-			// reduces heap size by ~20%.
+			// tiny对象的内存分配
 			off := c.tinyoffset
-			// Align tiny pointer for required (conservative) alignment.
-			if size&7 == 0 {
+			// 对齐 调整偏移量
+			if size&7 == 0 {	// 7的倍数的大小调整成8的
 				off = alignUp(off, 8)
 			} else if sys.PtrSize == 4 && size == 12 {
 				// Conservatively align 12-byte objects to 8 bytes on 32-bit
@@ -1030,20 +996,26 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			} else if size&1 == 0 {
 				off = alignUp(off, 2)
 			}
+			// 若偏移量+size小于16B 则进行小对象分配
 			if off+size <= maxTinySize && c.tiny != 0 {
 				// The object fits into existing tiny block.
 				x = unsafe.Pointer(c.tiny + off)
 				c.tinyoffset = off + size
-				c.tinyAllocs++
+				c.tinyAllocs++	// 申请的个数+1
 				mp.mallocing = 0
 				releasem(mp)
 				return x
 			}
-			// Allocate a new maxTinySize block.
+			// 当前tiny 块内存空间不足，向mache申请一个span
+			// tinySpanClass = 5 (0,0,1,1,2 我们介绍过0,0不使用，1，1是8B此时不够用，这里使用下一级别的也就是5->16B)
 			span = c.alloc[tinySpanClass]
+			// 尝试从当前的span 获取内存，获取不到返回0,也就是我需要大小为16B的span
 			v := nextFreeFast(span)
 			if v == 0 {
-				v, span, shouldhelpgc = c.nextFree(tinySpanClass)
+				// 没有从 allocCache 获取到内存，netxtFree函数
+				// 尝试从 mcentral获取一个新的对应规格的span内存
+				// 替换原先内存空间不足的内存块，并分配内存
+				v, span, shouldhelpgc = c.nextFree(tinySpanClass)	// 下面会讲解
 			}
 			x = unsafe.Pointer(v)
 			(*[2]uint64)(x)[0] = 0
@@ -1056,17 +1028,26 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 				c.tinyoffset = size
 			}
 			size = maxTinySize
-		} else {
+		} else {	// 一般对象分配
 			var sizeclass uint8
+			// 这里将所有级别分为2类
+			// 1) size <= 1024-8
 			if size <= smallSizeMax-8 {
+				// eg: size =700 (size+smallSizeDiv-1)/smallSizeDiv = (700+8-1/8)= 88  sizeclass=28 =>704
+				// 获取size对应的sizeclass
 				sizeclass = size_to_class8[divRoundUp(size, smallSizeDiv)]
 			} else {
+				// 2) size >1024-8
+				// 获取size对应的sizeclass
 				sizeclass = size_to_class128[divRoundUp(size-smallSizeMax, largeSizeDiv)]
 			}
+			// sizeclass对应的size，也就是span的大小
 			size = uintptr(class_to_size[sizeclass])
 			spc := makeSpanClass(sizeclass, noscan)
+			// 找到对应的span
 			span = c.alloc[spc]
-			v := nextFreeFast(span)
+			//尝试从 allocCache 获取内存，获取不到返回0
+			v := nextFreeFast(span)	// 下面会讲解
 			if v == 0 {
 				v, span, shouldhelpgc = c.nextFree(spc)
 			}
@@ -1075,11 +1056,10 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 				memclrNoHeapPointers(unsafe.Pointer(v), size)
 			}
 		}
-	} else {
+	} else {	// 大对象分配
 		shouldhelpgc = true
-		// For large allocations, keep track of zeroed state so that
-		// bulk zeroing can be happen later in a preemptible context.
-		span, isZeroed = c.allocLarge(size, needzero && !noscan, noscan)
+		// 直接从mheap申请
+		span, isZeroed = c.allocLarge(size, needzero && !noscan, noscan)	// 下面会讲解
 		span.freeindex = 1
 		span.allocCount = 1
 		x = unsafe.Pointer(span.base())
@@ -1221,9 +1201,7 @@ func memclrNoHeapPointersChunked(size uintptr, x unsafe.Pointer) {
 	}
 }
 
-// implementation of new builtin
-// compiler (both frontend and SSA backend) knows the signature
-// of this function
+// 内存申请和回收的入口
 func newobject(typ *_type) unsafe.Pointer {
 	return mallocgc(typ.size, typ, true)
 }

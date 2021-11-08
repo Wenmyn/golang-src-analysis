@@ -35,20 +35,17 @@ type mcache struct {
 	//
 	// tinyAllocs is the number of tiny allocations performed
 	// by the P that owns this mcache.
-	tiny       uintptr
-	tinyoffset uintptr
-	tinyAllocs uintptr
+	tiny       uintptr	// 分配器起始地址
+	tinyoffset uintptr	// 下一个空闲地偏置
+	tinyAllocs uintptr	// 已经分配的对象个数
 
 	// The rest is not accessed on every malloc.
 
-	alloc [numSpanClasses]*mspan // spans to allocate from, indexed by spanClass
-
+	alloc [numSpanClasses]*mspan // 申请的136个span
+	// 栈链表
 	stackcache [_NumStackOrders]stackfreelist
 
-	// flushGen indicates the sweepgen during which this mcache
-	// was last flushed. If flushGen != mheap_.sweepgen, the spans
-	// in this mcache are stale and need to the flushed so they
-	// can be swept. This is done in acquirep.
+	// Local allocator stats, flushed during GC.
 	flushGen uint32
 }
 
@@ -158,8 +155,9 @@ func (c *mcache) refill(spc spanClass) {
 		mheap_.central[spc].mcentral.uncacheSpan(s)
 	}
 
-	// Get a new cached span from the central lists.
-	s = mheap_.central[spc].mcentral.cacheSpan()
+	// 向central进行申请
+	// cacheSpan是向mcentral申请span的核心接口
+	s = mheap_.central[spc].mcentral.cacheSpan() // 下面会讲解
 	if s == nil {
 		throw("out of memory")
 	}
@@ -205,26 +203,23 @@ func (c *mcache) refill(spc spanClass) {
 	c.alloc[spc] = s
 }
 
-// allocLarge allocates a span for a large object.
-// The boolean result indicates whether the span is known-zeroed.
-// If it did not need to be zeroed, it may not have been zeroed;
-// but if it came directly from the OS, it is already zeroed.
+// 大对象申请
 func (c *mcache) allocLarge(size uintptr, needzero bool, noscan bool) (*mspan, bool) {
+	// 内存溢出判断
 	if size+_PageSize < size {
 		throw("out of memory")
 	}
+	// 计算出对象所需的页数 对于大于32K的大内存分配都是整数页
 	npages := size >> _PageShift
 	if size&_PageMask != 0 {
 		npages++
 	}
 
-	// Deduct credit for this span allocation and sweep if
-	// necessary. mHeap_Alloc will also sweep npages, so this only
-	// pays the debt down to npage pages.
 	deductSweepCredit(npages*_PageSize, npages)
 
+	// 分配函数的具体实现，使用span->sizeclass=0
 	spc := makeSpanClass(0, noscan)
-	s, isZeroed := mheap_.alloc(npages, spc, needzero)
+	s, isZeroed := mheap_.alloc(npages, spc, needzero)	 // 下面会讲解
 	if s == nil {
 		throw("out of memory")
 	}

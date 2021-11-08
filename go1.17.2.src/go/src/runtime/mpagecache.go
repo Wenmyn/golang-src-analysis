@@ -16,9 +16,9 @@ const pageCachePages = 8 * unsafe.Sizeof(pageCache{}.cache)
 // a pageCachePages*pageSize chunk of memory with 0 or more free
 // pages in it.
 type pageCache struct {
-	base  uintptr // base address of the chunk
-	cache uint64  // 64-bit bitmap representing free pages (1 means free)
-	scav  uint64  // 64-bit bitmap representing scavenged pages (1 means scavenged)
+	base  uintptr // 虚拟内存的基址 base address of the chunk
+	cache uint64  // bit位标记内存是否被分配
+	scav  uint64  // bit位标记内存是否被回收
 }
 
 // empty returns true if the pageCache has any free pages, and false
@@ -27,14 +27,7 @@ func (c *pageCache) empty() bool {
 	return c.cache == 0
 }
 
-// alloc allocates npages from the page cache and is the main entry
-// point for allocation.
-//
-// Returns a base address and the amount of scavenged memory in the
-// allocated region in bytes.
-//
-// Returns a base address of zero on failure, in which case the
-// amount of scavenged memory should be ignored.
+// 在heap进行页申请
 func (c *pageCache) alloc(npages uintptr) (uintptr, uintptr) {
 	if c.cache == 0 {
 		return 0, 0
