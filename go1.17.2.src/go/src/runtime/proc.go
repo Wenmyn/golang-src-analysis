@@ -6326,7 +6326,9 @@ func setMaxThreads(in int) (out int) {
 	return
 }
 
-//go:nosplit
+// 1.将当前goroutine绑定的m的locks加一,由canPreemptM可以看出，M是否可以被强占，
+// locks是否等于0，是必备条件之一 因此locks加一，能保证在procPin期间，当前goroutine不会被强占
+// 2.返回当前P的id
 func procPin() int {
 	_g_ := getg()
 	mp := _g_.m
@@ -6335,14 +6337,14 @@ func procPin() int {
 	return int(mp.p.ptr().id)
 }
 
-//go:nosplit
+// 1.获取当前goroutine的M，将其locks减一，与procPin里面的加一向匹配
 func procUnpin() {
 	_g_ := getg()
 	_g_.m.locks--
 }
 
-//go:linkname sync_runtime_procPin sync.runtime_procPin
-//go:nosplit
+// 1.先获取当前goroutine，然后绑定到对应的M上
+// 2.然后返回M目前绑定的P的id，因为这个pid后面会用到，防止在使用途中P被抢占
 func sync_runtime_procPin() int {
 	return procPin()
 }

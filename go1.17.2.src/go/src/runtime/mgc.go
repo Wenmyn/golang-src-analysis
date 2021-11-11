@@ -662,6 +662,7 @@ func gcStart(trigger gcTrigger) {
 
 	// clearpools before we start the GC. If we wait they memory will not be
 	// reclaimed until the next GC cycle.
+	// 清除pool中的资源
 	clearpools()
 
 	work.cycles++

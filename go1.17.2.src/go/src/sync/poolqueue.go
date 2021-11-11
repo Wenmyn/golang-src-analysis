@@ -184,13 +184,8 @@ func (d *poolDequeue) popTail() (interface{}, bool) {
 	return val, true
 }
 
-// poolChain is a dynamically-sized version of poolDequeue.
-//
-// This is implemented as a doubly-linked list queue of poolDequeues
-// where each dequeue is double the size of the previous one. Once a
-// dequeue fills up, this allocates a new one and only ever pushes to
-// the latest dequeue. Pops happen from the other end of the list and
-// once a dequeue is exhausted, it gets removed from the list.
+
+
 type poolChain struct {
 	// head is the poolDequeue to push to. This is only accessed
 	// by the producer, so doesn't need to be synchronized.
@@ -227,6 +222,8 @@ func loadPoolChainElt(pp **poolChainElt) *poolChainElt {
 
 func (c *poolChain) pushHead(val interface{}) {
 	d := c.head
+	// 未初始化，则进行初始化，c的head和tail都设置为新创建的d，d里的数组vals大小为8
+	// poolChainElt为一队列，数据放在数组里面。
 	if d == nil {
 		// Initialize the chain.
 		const initSize = 8 // Must be a power of 2
@@ -235,19 +232,20 @@ func (c *poolChain) pushHead(val interface{}) {
 		c.head = d
 		storePoolChainElt(&c.tail, d)
 	}
-
+	// 将val放入d里，如果d满了，新创建一个poolChainElt
 	if d.pushHead(val) {
 		return
 	}
 
-	// The current dequeue is full. Allocate a new one of twice
-	// the size.
+	// 新创建一个poolChainElt，大小为之前的2倍，最大值为1<<30
 	newSize := len(d.vals) * 2
 	if newSize >= dequeueLimit {
 		// Can't make it any bigger.
 		newSize = dequeueLimit
 	}
 
+	// 然后将新创建的poolChainElt挂在到d的next下去
+	// d为前一个值，head为新创建的d2
 	d2 := &poolChainElt{prev: d}
 	d2.vals = make([]eface, newSize)
 	c.head = d2
@@ -257,32 +255,32 @@ func (c *poolChain) pushHead(val interface{}) {
 
 func (c *poolChain) popHead() (interface{}, bool) {
 	d := c.head
+	// 从head开始获取
 	for d != nil {
+		// 如果当前的d的链表里有数据，如果存在，直接返回
 		if val, ok := d.popHead(); ok {
 			return val, ok
 		}
 		// There may still be unconsumed elements in the
 		// previous dequeue, so try backing up.
+		// 如果不存在，则从prev前一个里获取
 		d = loadPoolChainElt(&d.prev)
 	}
 	return nil, false
 }
 
+// 当前P里面获取不到缓存变量时，会调用popTail，从其它的P的local里面偷
 func (c *poolChain) popTail() (interface{}, bool) {
 	d := loadPoolChainElt(&c.tail)
+	// 如果最后一个节点是空的，那么直接返回
 	if d == nil {
 		return nil, false
 	}
 
 	for {
-		// It's important that we load the next pointer
-		// *before* popping the tail. In general, d may be
-		// transiently empty, but if next is non-nil before
-		// the pop and the pop fails, then d is permanently
-		// empty, which is the only condition under which it's
-		// safe to drop d from the chain.
+		// 这里获取的是next节点，与一般的双向链表是相反的
 		d2 := loadPoolChainElt(&d.next)
-
+		// 获取尾部对象
 		if val, ok := d.popTail(); ok {
 			return val, ok
 		}
@@ -293,10 +291,7 @@ func (c *poolChain) popTail() (interface{}, bool) {
 			return nil, false
 		}
 
-		// The tail of the chain has been drained, so move on
-		// to the next dequeue. Try to drop it from the chain
-		// so the next pop doesn't have to look at the empty
-		// dequeue again.
+		// 因为d已经没有数据了，所以重置tail为d2，并删除d2的上一个节点
 		if atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&c.tail)), unsafe.Pointer(d), unsafe.Pointer(d2)) {
 			// We won the race. Clear the prev pointer so
 			// the garbage collector can collect the empty
