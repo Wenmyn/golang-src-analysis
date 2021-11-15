@@ -35,9 +35,14 @@ type pollDesc struct {
 
 var serverInit sync.Once
 
+//最终跳转到该处，主要关注两个函数runtime_pollServerInit，runtime_pollOpen，
+//这两个函数都是runtime实现的，将epoll交由runtime来管理
 func (pd *pollDesc) init(fd *FD) error {
+	//sync.once方法，调用epoll_create创建eventpoll对象
 	serverInit.Do(runtime_pollServerInit)
+	//将当前的fd加到epoll中，底层调用epollctl函数
 	ctx, errno := runtime_pollOpen(uintptr(fd.Sysfd))
+	//如果出错，处理相应的fd，删除epoll中fd以及解除状态等操作
 	if errno != 0 {
 		return errnoErr(syscall.Errno(errno))
 	}
@@ -81,6 +86,7 @@ func (pd *pollDesc) wait(mode int, isFile bool) error {
 	if pd.runtimeCtx == 0 {
 		return errors.New("waiting for unsupported file type")
 	}
+	//进入runtime_pollWait方法内部，该方法会跳转到runtime包下，条件满足会park住goroutine
 	res := runtime_pollWait(pd.runtimeCtx, mode)
 	return convertErr(res, isFile)
 }

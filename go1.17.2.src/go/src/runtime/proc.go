@@ -329,23 +329,7 @@ func goschedguarded() {
 	mcall(goschedguarded_m)
 }
 
-// Puts the current goroutine into a waiting state and calls unlockf on the
-// system stack.
-//
-// If unlockf returns false, the goroutine is resumed.
-//
-// unlockf must not access this G's stack, as it may be moved between
-// the call to gopark and the call to unlockf.
-//
-// Note that because unlockf is called after putting the G into a waiting
-// state, the G may have already been readied by the time unlockf is called
-// unless there is external synchronization preventing the G from being
-// readied. If unlockf returns false, it must guarantee that the G cannot be
-// externally readied.
-//
-// Reason explains why the goroutine has been parked. It is displayed in stack
-// traces and heap dumps. Reasons should be unique and descriptive. Do not
-// re-use reasons, add new ones.
+
 func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason waitReason, traceEv byte, traceskip int) {
 	if reason != waitReasonSleep {
 		checkTimeouts() // timeouts may expire while two goroutines keep the scheduler busy
@@ -356,13 +340,15 @@ func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason w
 	if status != _Grunning && status != _Gscanrunning {
 		throw("gopark: bad g status")
 	}
+	//主要关注两个传参，lock是gpp指针
 	mp.waitlock = lock
+	//unlockf为netpollblockcommit函数
 	mp.waitunlockf = unlockf
 	gp.waitreason = reason
 	mp.waittraceev = traceEv
 	mp.waittraceskip = traceskip
 	releasem(mp)
-	// can't do anything that might move the G between Ms here.
+	//切换到g0栈去执行park_m
 	mcall(park_m)
 }
 
@@ -2707,14 +2693,14 @@ func execute(gp *g, inheritTime bool) {
 	gogo(&gp.sched)
 }
 
-// Finds a runnable goroutine to execute.
-// Tries to steal from other P's, get g from local or global queue, poll network.
+// 唤醒park住的协程
+// 1.go会在调度goroutine时候执行epoll_wait系统调用，检查是否有状态发生改变的fd，
+// 有的话就把他取出，唤醒对应的goroutine去处理。
+// 注：该部分对应了runtime中的netpoll方法。
+// 2.源码调用：runtime中的schedule() -> findrunnable() -> netpoll()
 func findrunnable() (gp *g, inheritTime bool) {
 	_g_ := getg()
-
-	// The conditions here and in handoffp must agree: if
-	// findrunnable would return a G to run, handoffp must start
-	// an M.
+	//分别从本地队列和全局队列寻找可执行的g
 
 top:
 	_p_ := _g_.m.p.ptr()
@@ -2752,21 +2738,20 @@ top:
 		}
 	}
 
-	// Poll network.
-	// This netpoll is only an optimization before we resort to stealing.
-	// We can safely skip it if there are no waiters or a thread is blocked
-	// in netpoll already. If there is any kind of logical race with that
-	// blocked thread (e.g. it has already returned from netpoll, but does
-	// not set lastpoll yet), this thread will do blocking netpoll below
-	// anyway.
+	//判断是否满足条件，初始化netpoll对象，是否等待者，以及上次调用时间
 	if netpollinited() && atomic.Load(&netpollWaiters) > 0 && atomic.Load64(&sched.lastpoll) != 0 {
+		//netpoll底层调用epoll_wait，传参代表epoll_wait时候是阻塞等待或者非阻塞直接返回
+		//这里是非阻塞模式，会立即返回内核eventpoll对象的rdlist列表
 		if list := netpoll(0); !list.empty() { // non-blocking
 			gp := list.pop()
+			//将可运行G的列表注入调度程序并清除glist
 			injectglist(&list)
+			//修改gp状态
 			casgstatus(gp, _Gwaiting, _Grunnable)
 			if trace.enabled {
 				traceGoUnpark(gp, 0)
 			}
+			//返回可运行的g
 			return gp, false
 		}
 	}
@@ -3499,17 +3484,21 @@ func parkunlock_c(gp *g, lock unsafe.Pointer) bool {
 
 // park continuation on g0.
 func park_m(gp *g) {
+	//获取当前goroutine
 	_g_ := getg()
 
 	if trace.enabled {
 		traceGoPark(_g_.m.waittraceev, _g_.m.waittraceskip)
 	}
-
+	//修改状态为Gwaiting，代表当前的goroutine被park住了
 	casgstatus(gp, _Grunning, _Gwaiting)
+	//解除m和g关联
 	dropg()
 
 	if fn := _g_.m.waitunlockf; fn != nil {
+		//调用刚传入的函数参数，也就是netpollblockcommit
 		ok := fn(gp, _g_.m.waitlock)
+		//调用完清除
 		_g_.m.waitunlockf = nil
 		_g_.m.waitlock = nil
 		if !ok {
@@ -3520,6 +3509,7 @@ func park_m(gp *g) {
 			execute(gp, true) // Schedule it back, never returns.
 		}
 	}
+	//调度新的g到m上来
 	schedule()
 }
 

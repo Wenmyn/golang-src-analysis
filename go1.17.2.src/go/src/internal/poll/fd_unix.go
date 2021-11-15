@@ -139,7 +139,9 @@ func (fd *FD) SetBlocking() error {
 // Use 1GB instead of, say, 2GB-1, to keep subsequent reads aligned.
 const maxRW = 1 << 30
 
-// Read implements io.Reader.
+// 说明：
+// 1.该函数在读取时候如果缓冲区不可读，该goroutine也会陪park住，
+// 等待socket fd可读，调度器通过netpoll函数调度它。
 func (fd *FD) Read(p []byte) (int, error) {
 	if err := fd.readLock(); err != nil {
 		return 0, err
@@ -160,10 +162,13 @@ func (fd *FD) Read(p []byte) (int, error) {
 		p = p[:maxRW]
 	}
 	for {
+		//系统调用读取缓冲区数据，这里没有可读会直接返回，不会阻塞
 		n, err := ignoringEINTRIO(syscall.Read, fd.Sysfd, p)
 		if err != nil {
 			n = 0
 			if err == syscall.EAGAIN && fd.pd.pollable() {
+				//不可读，进入waitRead方法，park住该goroutine，
+				//并记录goroutine到pd的rg中,等待唤醒
 				if err = fd.pd.waitRead(fd.isFile); err == nil {
 					continue
 				}
@@ -379,19 +384,22 @@ func (fd *FD) WriteMsg(p []byte, oob []byte, sa syscall.Sockaddr) (int, int, err
 	}
 }
 
-// Accept wraps the accept network call.
+//上面提到过的accept函数，根据序号顺序分析
 func (fd *FD) Accept() (int, syscall.Sockaddr, string, error) {
 	if err := fd.readLock(); err != nil {
 		return -1, nil, "", err
 	}
 	defer fd.readUnlock()
-
+	//检查fd状态是否变化
 	if err := fd.pd.prepareRead(fd.isFile); err != nil {
 		return -1, nil, "", err
 	}
 	for {
+		//accept系统调用，如果有对监听的socket的连接请求，则直接返回发起连接的socket文件描述符
+		//，否则返回EAGAIN错误，被下面捕获到
 		s, rsa, errcall, err := accept(fd.Sysfd)
 		if err == nil {
+			//3.返回新的进程描述符
 			return s, rsa, "", err
 		}
 		switch err {
@@ -399,6 +407,8 @@ func (fd *FD) Accept() (int, syscall.Sockaddr, string, error) {
 			continue
 		case syscall.EAGAIN:
 			if fd.pd.pollable() {
+				//进入waitRead方法，内部
+				//1.刚才阻塞到了这个goroutine，后来新的连接请求，该goroutine被唤醒
 				if err = fd.pd.waitRead(fd.isFile); err == nil {
 					continue
 				}

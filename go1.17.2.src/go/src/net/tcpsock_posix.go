@@ -166,6 +166,7 @@ func (ln *TCPListener) file() (*os.File, error) {
 }
 
 func (sl *sysListener) listenTCP(ctx context.Context, laddr *TCPAddr) (*TCPListener, error) {
+	//此处mode为"listen"，可以表示一个tcp服务端；此外还有一个mode为"dial"，表示连接的发起端，可以表示一个tcp客户端
 	fd, err := internetSocket(ctx, sl.network, laddr, nil, syscall.SOCK_STREAM, 0, "listen", sl.ListenConfig.Control)
 	if err != nil {
 		return nil, err

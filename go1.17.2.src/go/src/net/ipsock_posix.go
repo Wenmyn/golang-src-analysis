@@ -70,74 +70,46 @@ func (p *ipStackCapabilities) probe() {
 	}
 }
 
-// favoriteAddrFamily returns the appropriate address family for the
-// given network, laddr, raddr and mode.
-//
-// If mode indicates "listen" and laddr is a wildcard, we assume that
-// the user wants to make a passive-open connection with a wildcard
-// address family, both AF_INET and AF_INET6, and a wildcard address
-// like the following:
-//
-//	- A listen for a wildcard communication domain, "tcp" or
-//	  "udp", with a wildcard address: If the platform supports
-//	  both IPv6 and IPv4-mapped IPv6 communication capabilities,
-//	  or does not support IPv4, we use a dual stack, AF_INET6 and
-//	  IPV6_V6ONLY=0, wildcard address listen. The dual stack
-//	  wildcard address listen may fall back to an IPv6-only,
-//	  AF_INET6 and IPV6_V6ONLY=1, wildcard address listen.
-//	  Otherwise we prefer an IPv4-only, AF_INET, wildcard address
-//	  listen.
-//
-//	- A listen for a wildcard communication domain, "tcp" or
-//	  "udp", with an IPv4 wildcard address: same as above.
-//
-//	- A listen for a wildcard communication domain, "tcp" or
-//	  "udp", with an IPv6 wildcard address: same as above.
-//
-//	- A listen for an IPv4 communication domain, "tcp4" or "udp4",
-//	  with an IPv4 wildcard address: We use an IPv4-only, AF_INET,
-//	  wildcard address listen.
-//
-//	- A listen for an IPv6 communication domain, "tcp6" or "udp6",
-//	  with an IPv6 wildcard address: We use an IPv6-only, AF_INET6
-//	  and IPV6_V6ONLY=1, wildcard address listen.
-//
-// Otherwise guess: If the addresses are IPv4 then returns AF_INET,
-// or else returns AF_INET6. It also returns a boolean value what
-// designates IPV6_V6ONLY option.
-//
-// Note that the latest DragonFly BSD and OpenBSD kernels allow
-// neither "net.inet6.ip6.v6only=1" change nor IPPROTO_IPV6 level
-// IPV6_V6ONLY socket option setting.
+// 看下这个用于判断地址类型的函数
 func favoriteAddrFamily(network string, laddr, raddr sockaddr, mode string) (family int, ipv6only bool) {
+	//可以看到，如果直接写明"tcp4"或"tcp6"时会直接返回对应的地址类型
 	switch network[len(network)-1] {
 	case '4':
 		return syscall.AF_INET, false
 	case '6':
 		return syscall.AF_INET6, true
 	}
-
+	//下面用于处理network为"tcp的场景"，可以看出直接指定"tcp4"或"tcp6"时可以提高一些执行效率，但可能影响扩展性
+	//如果使用监听模式，且本地没有指定监听地址，需要通过对系统本地地址进行测试来判定使用的IP类型
 	if mode == "listen" && (laddr == nil || laddr.isWildcard()) {
+		//supportsIPv4map函数用于测试系统是否支持ipv4MappedIPv6功能。如果系统支持该功能，或者不支持IPv4，则使用IPv6
 		if supportsIPv4map() || !supportsIPv4() {
 			return syscall.AF_INET6, false
 		}
+		//如果没有指定监听地址，同时不支持ipv4MappedIPv6功能，且支持IPv4，则使用IPv4
 		if laddr == nil {
 			return syscall.AF_INET, false
 		}
+		//通过判断IP地址(长度和格式)来判断所使用的IP类型。实现函数定义在src/net/tcpsock_posix.go中
 		return laddr.family(), false
 	}
 
+	//如果未指定本端和远端地址或明确指定了本端和远端需要的地址类型为IPv4，则使用IPv4。可用于处理"listen"和"dial" mode。
+	//"listen" mode下已经处理了laddr == nil的情况，如果laddr非nil，调用family()函数判断IP类型即可获得IP类型
 	if (laddr == nil || laddr.family() == syscall.AF_INET) &&
 		(raddr == nil || raddr.family() == syscall.AF_INET) {
 		return syscall.AF_INET, false
 	}
+	//其他情况使用IPv6，如仅支持IPv6的场景
 	return syscall.AF_INET6, false
 }
 
 func internetSocket(ctx context.Context, net string, laddr, raddr sockaddr, sotype, proto int, mode string, ctrlFn func(string, string, syscall.RawConn) error) (fd *netFD, err error) {
+	//此处判断mode为"dial"的场景。如果"dial" mode下的远端IP为通配符，则将远端IP转换为本地IP(127.0.0.1或::1),即默认连接本地server。
 	if (runtime.GOOS == "aix" || runtime.GOOS == "windows" || runtime.GOOS == "openbsd") && mode == "dial" && raddr.isWildcard() {
 		raddr = raddr.toLocal(net)
 	}
+	//favoriteAddrFamily函数用于判断地址类型为IPv4还是IPv6，主要用于net为"tcp"时的场景。
 	family, ipv6only := favoriteAddrFamily(net, laddr, raddr, mode)
 	return socket(ctx, net, family, sotype, proto, ipv6only, laddr, raddr, ctrlFn)
 }

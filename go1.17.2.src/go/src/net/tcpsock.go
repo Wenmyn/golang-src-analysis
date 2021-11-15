@@ -313,21 +313,16 @@ func (l *TCPListener) File() (f *os.File, err error) {
 	return
 }
 
-// ListenTCP acts like Listen for TCP networks.
-//
-// The network must be a TCP network name; see func Dial for details.
-//
-// If the IP field of laddr is nil or an unspecified IP address,
-// ListenTCP listens on all available unicast and anycast IP addresses
-// of the local system.
-// If the Port field of laddr is 0, a port number is automatically
-// chosen.
+
+
 func ListenTCP(network string, laddr *TCPAddr) (*TCPListener, error) {
 	switch network {
+	//支持tcp协议为”tcp4“和“tcp6”，当使用"tcp"时可以通过地址格式进行判断
 	case "tcp", "tcp4", "tcp6":
 	default:
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: laddr.opAddr(), Err: UnknownNetworkError(network)}
 	}
+	//对laddr进行初始化(非nil),用于在socket函数中进入监听处理流程(见下文)
 	if laddr == nil {
 		laddr = &TCPAddr{}
 	}

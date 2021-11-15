@@ -39,6 +39,7 @@ var (
 )
 
 func netpollinit() {
+	// 系统调用，创建一个eventpoll对象
 	iocphandle = stdcall4(_CreateIoCompletionPort, _INVALID_HANDLE_VALUE, 0, 0, _DWORD_MAX)
 	if iocphandle == 0 {
 		println("runtime: CreateIoCompletionPort failed (errno=", getlasterror(), ")")
@@ -50,7 +51,13 @@ func netpollIsPollDescriptor(fd uintptr) bool {
 	return fd == iocphandle
 }
 
+// Golang也提供了对于epoll item节点的删除操作，具体封装函数poll_runtime_pollClose
 func netpollopen(fd uintptr, pd *pollDesc) int32 {
+	//注册event事件，这里使用了epoll的ET模式，相对于ET，ET需要每次产生事件时候就要处理事件，
+	//否则容易丢失事件。
+
+	// events记录上pd的指针
+	// 系统调用将该fd加到eventpoll对象中，交由内核监听
 	if stdcall4(_CreateIoCompletionPort, fd, iocphandle, 0, 0) == 0 {
 		return int32(getlasterror())
 	}
@@ -75,11 +82,7 @@ func netpollBreak() {
 	}
 }
 
-// netpoll checks for ready network connections.
-// Returns list of goroutines that become runnable.
-// delay < 0: blocks indefinitely
-// delay == 0: does not block, just polls
-// delay > 0: block for up to that many nanoseconds
+//对epoll_wait的进一步封装
 func netpoll(delay int64) gList {
 	var entries [64]overlappedEntry
 	var wait, qty, flags, n, i uint32

@@ -48,6 +48,7 @@ func newFD(sysfd syscall.Handle, family, sotype int, net string) (*netFD, error)
 }
 
 func (fd *netFD) init() error {
+	//将socket fd加到poll，进入
 	errcall, err := fd.pfd.Init(fd.net, true)
 	if errcall != "" {
 		err = wrapSyscallError(errcall, err)

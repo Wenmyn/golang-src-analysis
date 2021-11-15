@@ -169,7 +169,9 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa sysc
 	}
 }
 
+//返回上一层的函数
 func (fd *netFD) accept() (netfd *netFD, err error) {
+	//此时获取到了新的fd
 	d, rsa, errcall, err := fd.pfd.Accept()
 	if err != nil {
 		if errcall != "" {
@@ -178,14 +180,20 @@ func (fd *netFD) accept() (netfd *netFD, err error) {
 		return nil, err
 	}
 
+	//创建新的fd结构体
 	if netfd, err = newFD(d, fd.family, fd.sotype, fd.net); err != nil {
 		poll.CloseFunc(d)
 		return nil, err
 	}
+
+	//init函数又会进入func (pd *pollDesc) init(fd *FD) error函数，并将新的socket连接通过epoll_ctl传入
+	//epoll的监听事件
 	if err = netfd.init(); err != nil {
 		netfd.Close()
 		return nil, err
 	}
+
+	//系统调用，可以获得客户端的socket的ip信息等
 	lsa, _ := syscall.Getsockname(netfd.pfd.Sysfd)
 	netfd.setAddr(netfd.addrFunc()(lsa), netfd.addrFunc()(rsa))
 	return netfd, nil

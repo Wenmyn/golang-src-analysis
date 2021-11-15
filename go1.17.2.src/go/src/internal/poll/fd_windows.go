@@ -275,11 +275,8 @@ const (
 // logInitFD is set by tests to enable file descriptor initialization logging.
 var logInitFD func(net string, fd *FD, err error)
 
-// Init initializes the FD. The Sysfd field should already be set.
-// This can be called multiple times on a single FD.
-// The net argument is a network name from the net package (e.g., "tcp"),
-// or "file" or "console" or "dir".
-// Set pollable to true if fd should be managed by runtime netpoll.
+//最终跳转到该处，主要关注两个函数runtime_pollServerInit，runtime_pollOpen，
+//这两个函数都是runtime实现的，将epoll交由runtime来管理
 func (fd *FD) Init(net string, pollable bool) (string, error) {
 	if initErr != nil {
 		return "", initErr
@@ -317,6 +314,8 @@ func (fd *FD) Init(net string, pollable bool) (string, error) {
 		// somehow call execIO, then execIO, and therefore the
 		// calling method, will return an error, because
 		// fd.pd.runtimeCtx will be 0.
+
+		//将socket fd加到poll，进入
 		err = fd.pd.init(fd)
 	}
 	if logInitFD != nil {

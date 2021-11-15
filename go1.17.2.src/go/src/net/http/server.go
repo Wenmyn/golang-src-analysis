@@ -1852,6 +1852,7 @@ func (c *conn) serve(ctx context.Context) {
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
 
 	for {
+		// 读request请求
 		w, err := c.readRequest(ctx)
 		if c.r.remain != c.server.initialReadLimitSize() {
 			// If we read any bytes off the wire, we're active.
@@ -1926,11 +1927,19 @@ func (c *conn) serve(ctx context.Context) {
 		// in parallel even if their responses need to be serialized.
 		// But we're not going to implement HTTP pipelining because it
 		// was never deployed in the wild and the answer is HTTP/2.
+
+		// 调用业务层定义的路由
 		serverHandler{c.server}.ServeHTTP(w, w.req)
 		w.cancelCtx()
 		if c.hijacked() {
 			return
 		}
+
+		// flush刷io buffer的数据
+		// -说明：
+		// 1.readRequest 便是读取数据，解析请求的地方，
+		// 包括解析请求的header、body，和一些基本的校验，比如header头信息，请求method等。
+		// 2.最后将请求的数据赋值到Request，并初始化Response对象，供业务层调用。
 		w.finishRequest()
 		if !w.shouldReuseConnection() {
 			if w.requestBodyLimitHit || w.closedRequestBodyEarly() {
@@ -2192,47 +2201,18 @@ func RedirectHandler(url string, code int) Handler {
 	return &redirectHandler{url, code}
 }
 
-// ServeMux is an HTTP request multiplexer.
-// It matches the URL of each incoming request against a list of registered
-// patterns and calls the handler for the pattern that
-// most closely matches the URL.
-//
-// Patterns name fixed, rooted paths, like "/favicon.ico",
-// or rooted subtrees, like "/images/" (note the trailing slash).
-// Longer patterns take precedence over shorter ones, so that
-// if there are handlers registered for both "/images/"
-// and "/images/thumbnails/", the latter handler will be
-// called for paths beginning "/images/thumbnails/" and the
-// former will receive requests for any other paths in the
-// "/images/" subtree.
-//
-// Note that since a pattern ending in a slash names a rooted subtree,
-// the pattern "/" matches all paths not matched by other registered
-// patterns, not just the URL with Path == "/".
-//
-// If a subtree has been registered and a request is received naming the
-// subtree root without its trailing slash, ServeMux redirects that
-// request to the subtree root (adding the trailing slash). This behavior can
-// be overridden with a separate registration for the path without
-// the trailing slash. For example, registering "/images/" causes ServeMux
-// to redirect a request for "/images" to "/images/", unless "/images" has
-// been registered separately.
-//
-// Patterns may optionally begin with a host name, restricting matches to
-// URLs on that host only. Host-specific patterns take precedence over
-// general patterns, so that a handler might register for the two patterns
-// "/codesearch" and "codesearch.google.com/" without also taking over
-// requests for "http://www.google.com/".
-//
-// ServeMux also takes care of sanitizing the URL request path and the Host
-// header, stripping the port number and redirecting any request containing . or
-// .. elements or repeated slashes to an equivalent, cleaner URL.
+// 默认路由器
 type ServeMux struct {
 	mu    sync.RWMutex
-	m     map[string]muxEntry
-	es    []muxEntry // slice of entries sorted from longest to shortest.
-	hosts bool       // whether any patterns contain hostnames
+	m     map[string]muxEntry // 用来存储路由pattern与handler的关系
+	es    []muxEntry 	// es 是一个slice，将路由按长度从大到小排序存储起来。
+	hosts bool       	// whether any patterns contain hostnames
 }
+
+// 匹配规则：
+// 1.首先精确匹配 m 中的pattern;
+// 2.如果在 m 不能精确匹配路径时，会在 es 中找到最接近的路由规则：比如注册了两个路径 /a/b/ /a/ ，
+// 当请求URL是 /a/b/c时，会匹配到 /a/b/ 而不是 /a/
 
 type muxEntry struct {
 	h       Handler
@@ -2285,14 +2265,13 @@ func stripHostPort(h string) string {
 // Find a handler on a handler map given a path string.
 // Most-specific (longest) pattern wins.
 func (mux *ServeMux) match(path string) (h Handler, pattern string) {
-	// Check for exact match first.
+	// 优先查找m表
 	v, ok := mux.m[path]
 	if ok {
 		return v.h, v.pattern
 	}
 
-	// Check for longest valid match.  mux.es contains all patterns
-	// that end in / sorted from longest to shortest.
+	// 未精确匹配成功，查询es（已排序），路径长的优先匹配
 	for _, e := range mux.es {
 		if strings.HasPrefix(path, e.pattern) {
 			return e.h, e.pattern
@@ -2410,8 +2389,7 @@ func (mux *ServeMux) handler(host, path string) (h Handler, pattern string) {
 	return
 }
 
-// ServeHTTP dispatches the request to the handler whose
-// pattern most closely matches the request URL.
+// 根据预设的pattern，将request分配最匹配的handler处理
 func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
 	if r.RequestURI == "*" {
 		if r.ProtoAtLeast(1, 1) {
@@ -2440,6 +2418,7 @@ func (mux *ServeMux) Handle(pattern string, handler Handler) {
 		panic("http: multiple registrations for " + pattern)
 	}
 
+	// 把路由表往 ServeMux.m 和 ServeMux.es 写的全过程
 	if mux.m == nil {
 		mux.m = make(map[string]muxEntry)
 	}
@@ -2998,8 +2977,10 @@ func (srv *Server) Serve(l net.Listener) error {
 
 	ctx := context.WithValue(baseCtx, ServerContextKey, srv)
 	for {
+		// 接受监听器listener的请求
 		rw, err := l.Accept()
 		if err != nil {
+			// 监听是否关闭信号
 			select {
 			case <-srv.getDoneChan():
 				return ErrServerClosed
@@ -3028,8 +3009,11 @@ func (srv *Server) Serve(l net.Listener) error {
 			}
 		}
 		tempDelay = 0
+		// 创建新连接
 		c := srv.newConn(rw)
+		// 再返回之前，设置连接状态
 		c.setState(c.rwc, StateNew, runHooks) // before Serve can return
+		// 创建goroutine，真正处理连接
 		go c.serve(connCtx)
 	}
 }

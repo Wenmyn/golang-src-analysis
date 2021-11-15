@@ -378,9 +378,7 @@ func listenerBacklog() int {
 	return listenerBacklogCache.val
 }
 
-// A Listener is a generic network listener for stream-oriented protocols.
-//
-// Multiple goroutines may invoke methods on a Listener simultaneously.
+// 因为golang支持tcp、udp等各种协议，天然使用golang的interface。
 type Listener interface {
 	// Accept waits for and returns the next connection to the listener.
 	Accept() (Conn, error)

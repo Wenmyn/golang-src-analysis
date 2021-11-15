@@ -15,51 +15,37 @@ import (
 )
 
 // socket returns a network file descriptor that is ready for
-// asynchronous I/O using the network poller.
+// asynchronous I/O using the network poller.	--此处应该是同步IO吧
+// 从下面注释中可以看出socket用于返回一个网络描述符。
+// listen场景下，需要使用socket->setsocketopt->bind->listen这几个系统调用来创建一个监听socket
 func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only bool, laddr, raddr sockaddr, ctrlFn func(string, string, syscall.RawConn) error) (fd *netFD, err error) {
+	//创建一个socket
 	s, err := sysSocket(family, sotype, proto)
 	if err != nil {
 		return nil, err
 	}
+	//设置socket选项，处理IPv6并设置允许广播
 	if err = setDefaultSockopts(s, family, sotype, ipv6only); err != nil {
 		poll.CloseFunc(s)
 		return nil, err
 	}
+	//初始化一个newFD，下面讲解
 	if fd, err = newFD(s, family, sotype, net); err != nil {
 		poll.CloseFunc(s)
 		return nil, err
 	}
 
-	// This function makes a network file descriptor for the
-	// following applications:
-	//
-	// - An endpoint holder that opens a passive stream
-	//   connection, known as a stream listener
-	//
-	// - An endpoint holder that opens a destination-unspecific
-	//   datagram connection, known as a datagram listener
-	//
-	// - An endpoint holder that opens an active stream or a
-	//   destination-specific datagram connection, known as a
-	//   dialer
-	//
-	// - An endpoint holder that opens the other connection, such
-	//   as talking to the protocol stack inside the kernel
-	//
-	// For stream and datagram listeners, they will only require
-	// named sockets, so we can assume that it's just a request
-	// from stream or datagram listeners when laddr is not nil but
-	// raddr is nil. Otherwise we assume it's just for dialers or
-	// the other connection holders.
-
+	// 用于处理TCP或UDP服务端。服务端需要确保本地监听地址非nil(但可以为"")，否则会被认为是一个客户端socket。ListenTCP中已经对laddr赋初值
 	if laddr != nil && raddr == nil {
 		switch sotype {
+		//处理流协议，TCP
 		case syscall.SOCK_STREAM, syscall.SOCK_SEQPACKET:
 			if err := fd.listenStream(laddr, listenerBacklog(), ctrlFn); err != nil {
 				fd.Close()
 				return nil, err
 			}
 			return fd, nil
+		//处理数据报协议，UDP
 		case syscall.SOCK_DGRAM:
 			if err := fd.listenDatagram(laddr, ctrlFn); err != nil {
 				fd.Close()
@@ -68,6 +54,7 @@ func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only
 			return fd, nil
 		}
 	}
+	//处理非监听socket场景，即客户端发起连接
 	if err := fd.dial(ctx, laddr, raddr, ctrlFn); err != nil {
 		fd.Close()
 		return nil, err
@@ -175,13 +162,16 @@ func (fd *netFD) dial(ctx context.Context, laddr, raddr sockaddr, ctrlFn func(st
 
 func (fd *netFD) listenStream(laddr sockaddr, backlog int, ctrlFn func(string, string, syscall.RawConn) error) error {
 	var err error
+	//此处设置了监听socket所使用的选项，允许地址socket重用，实际中并不推荐使用socket地址重用。
 	if err = setDefaultListenerSockopts(fd.pfd.Sysfd); err != nil {
 		return err
 	}
 	var lsa syscall.Sockaddr
+	//构建一个实现了syscall.Sockaddr结构的结构体，如syscall.SockaddrInet4/syscall.SockaddrInet4/syscall.SockaddrUnix
 	if lsa, err = laddr.sockaddr(fd.family); err != nil {
 		return err
 	}
+	//ctrlFn在bind前调用，可以用于设置socket选项。此处为nil。用法可以参考net/listen_test.go中的TestListenConfigControl函数
 	if ctrlFn != nil {
 		c, err := newRawConn(fd)
 		if err != nil {
@@ -191,15 +181,22 @@ func (fd *netFD) listenStream(laddr sockaddr, backlog int, ctrlFn func(string, s
 			return err
 		}
 	}
+	// 为socket绑定地址
 	if err = syscall.Bind(fd.pfd.Sysfd, lsa); err != nil {
 		return os.NewSyscallError("bind", err)
 	}
+	//  使用系统调用SYS_LISTEN，第二个参数表示监听队列大小，来自"/proc/sys/net/core/somaxconn"或syscall.SOMAXCONN(参见src/net/sock_linux.go)
+	//  该函数等同于系统调用：
+	//  #include<sys/socket.h>
+	//  int listen(int sockfd, int backlog)
 	if err = listenFunc(fd.pfd.Sysfd, backlog); err != nil {
 		return os.NewSyscallError("listen", err)
 	}
+	//fd.init中会初始化epoll,并注册文件描述符。用于在accept时有连接建立时上报连接事件通知。用法参见epoll+socket实现 socket并发 linux服务器
 	if err = fd.init(); err != nil {
 		return err
 	}
+	//获取socket信息，此处会使用系统调用getsockname来获得配置的socket信息，并设置到fd.laddr中。监听socket的fd.raddr为nil
 	lsa, _ = syscall.Getsockname(fd.pfd.Sysfd)
 	fd.setAddr(fd.addrFunc()(lsa), nil)
 	return nil
