@@ -432,12 +432,10 @@ func (c *gobServerCodec) Close() error {
 	return c.rwc.Close()
 }
 
-// ServeConn runs the server on a single connection.
-// ServeConn blocks, serving the connection until the client hangs up.
-// The caller typically invokes ServeConn in a go statement.
-// ServeConn uses the gob wire format (see package gob) on the
-// connection. To use an alternate codec, use ServeCodec.
-// See NewClient's comment for information about concurrent access.
+// 1.创建一个Codec结构体，去处理rpc协议
+// 2.主要处理rpc请求的部分就在ServeCodec里了参数是一个ServeCodec接口
+// 3.也就是如果你要自己实现一个rpc协议只需要去实现ServeCodec的方法就可以用上这个rpc库了，
+// 这个库默认是GobServeCodec（go 标准库中的序列化方式）此外还实现啦json的
 func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 	buf := bufio.NewWriter(conn)
 	srv := &gobServerCodec{
@@ -449,8 +447,13 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 	server.ServeCodec(srv)
 }
 
-// ServeCodec is like ServeConn but uses the specified codec to
-// decode requests and encode responses.
+// 1.sending是防止并发的往conn中写数据。
+// 2.wg是等service.call都执行完再退出。
+// -说明：
+// 1.主要逻辑也是一个for循环，读远端传来的数据解码成header或者body
+// 2.看下主要的俩函数
+// (1)server.readRequest(读数据解码成header body）
+// (2)service.call(调用rpc要请求的方法，将返回值返回给请求方)
 func (server *Server) ServeCodec(codec ServerCodec) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
@@ -539,6 +542,16 @@ func (server *Server) freeResponse(resp *Response) {
 	server.respLock.Unlock()
 }
 
+// 注意：
+// 1.方法里readRequestHeader先读请求头
+// 2.解析请求参codec.ReadRequestBody(argv.Interface())
+
+// 说明：
+// 1.获取一个req结构这个结构在server中一个链表上复用的这个比较细节不是重点
+// 2.codec.ReadRequestHeader(req) 调用codec实现的ReadRequestHeader解析数据设置req值
+
+// 流程：
+// 1.
 func (server *Server) readRequest(codec ServerCodec) (service *service, mtype *methodType, req *Request, argv, replyv reflect.Value, keepReading bool, err error) {
 	service, mtype, req, keepReading, err = server.readRequestHeader(codec)
 	if err != nil {
@@ -594,15 +607,18 @@ func (server *Server) readRequestHeader(codec ServerCodec) (svc *service, mtype 
 	// we can still recover and move on to the next request.
 	keepReading = true
 
+	// 区分服务名和方法名（按照.分隔）
 	dot := strings.LastIndex(req.ServiceMethod, ".")
 	if dot < 0 {
 		err = errors.New("rpc: service/method request ill-formed: " + req.ServiceMethod)
 		return
 	}
+	// 里面就一个ServiceMethod (serviceName.methodName） 和一个序号
 	serviceName := req.ServiceMethod[:dot]
 	methodName := req.ServiceMethod[dot+1:]
 
-	// Look up the request.
+	// server.serviceMap.Load(serviceName)这段代码是根据方法名找到要调用的方法
+	// 即：服务端运行前会调用 rpc.RegisterName("HelloService",new(HelloService))
 	svci, ok := server.serviceMap.Load(serviceName)
 	if !ok {
 		err = errors.New("rpc: can't find service " + req.ServiceMethod)
